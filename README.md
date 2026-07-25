@@ -43,7 +43,7 @@ This repository contains the source files for the engine. To use AGEE, add your 
 Example usage:
 
 ```ts
-import { AGEE } from "./index";
+import { AGEE } from "./src/index";
 
 const engine = new AGEE({ canvas: document.querySelector("canvas"), renderBackend: "webgpu" });
 await engine.init();

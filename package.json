@@ -1,0 +1,23 @@
+{
+  "name": "agee-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Adaptive Game Engine Environment (AGEE) — a modular TypeScript browser game engine.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.71",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.11"
+  }
+}

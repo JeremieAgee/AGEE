@@ -78,4 +78,3 @@ engine.start();
 
 Contributions are welcome. Add missing configuration files (package manifest, tsconfig, a test
 runner) and example projects to make the engine easier to build, test, and run.
-

@@ -1,0 +1,190 @@
+export type ScoreFunction = (eid: number, context: UtilityContext) => number;
+export type UtilityActionFn = (eid: number, dt: number, context: UtilityContext) => void;
+
+export interface UtilityContext {
+  dt: number;
+  blackboard: Map<string, any>;
+  currentAction: string;
+  actionTime: number;
+}
+
+export interface UtilityConsideration {
+  name: string;
+  score: ScoreFunction;
+  weight: number;
+}
+
+export interface UtilityAction {
+  name: string;
+  considerations: UtilityConsideration[];
+  execute: UtilityActionFn;
+  cooldown?: number;
+  minScore?: number;
+  bonus?: number;
+  momentum?: number;
+}
+
+export interface UtilitySet {
+  name: string;
+  actions: UtilityAction[];
+  defaultAction?: string;
+  inertia: number;
+}
+
+export class UtilitySetBuilder {
+  private name: string;
+  private actions: UtilityAction[] = [];
+  private defaultAction?: string;
+  private inertia = 0;
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  action(
+    name: string,
+    execute: UtilityActionFn,
+    considerations: UtilityConsideration[],
+    opts?: { cooldown?: number; minScore?: number; bonus?: number; momentum?: number }
+  ): this {
+    this.actions.push({
+      name,
+      execute,
+      considerations,
+      cooldown: opts?.cooldown,
+      minScore: opts?.minScore,
+      bonus: opts?.bonus,
+      momentum: opts?.momentum,
+    });
+    return this;
+  }
+
+  setDefault(name: string): this {
+    this.defaultAction = name;
+    return this;
+  }
+
+  setInertia(value: number): this {
+    this.inertia = value;
+    return this;
+  }
+
+  build(): UtilitySet {
+    return {
+      name: this.name,
+      actions: this.actions,
+      defaultAction: this.defaultAction,
+      inertia: this.inertia,
+    };
+  }
+}
+
+export interface UtilityInstance {
+  set: UtilitySet;
+  currentAction: string;
+  actionTime: number;
+  cooldowns: Map<string, number>;
+  blackboard: Map<string, any>;
+  lastScores: Map<string, number>;
+}
+
+export class UtilityRunner {
+  createInstance(set: UtilitySet): UtilityInstance {
+    return {
+      set,
+      currentAction: set.defaultAction ?? (set.actions[0]?.name ?? ""),
+      actionTime: 0,
+      cooldowns: new Map(),
+      blackboard: new Map(),
+      lastScores: new Map(),
+    };
+  }
+
+  tick(eid: number, instance: UtilityInstance, dt: number): string {
+    const ctx: UtilityContext = {
+      dt,
+      blackboard: instance.blackboard,
+      currentAction: instance.currentAction,
+      actionTime: instance.actionTime,
+    };
+
+    for (const [name, remaining] of instance.cooldowns) {
+      const next = remaining - dt;
+      if (next <= 0) instance.cooldowns.delete(name);
+      else instance.cooldowns.set(name, next);
+    }
+
+    let bestAction = "";
+    let bestScore = -Infinity;
+
+    for (const action of instance.set.actions) {
+      if (instance.cooldowns.has(action.name)) {
+        instance.lastScores.set(action.name, 0);
+        continue;
+      }
+
+      let score = this.scoreAction(eid, action, ctx);
+
+      if (action.bonus) score += action.bonus;
+
+      if (action.name === instance.currentAction) {
+        score += instance.set.inertia;
+        if (action.momentum) score += action.momentum;
+      }
+
+      instance.lastScores.set(action.name, score);
+
+      if (action.minScore !== undefined && score < action.minScore) continue;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestAction = action.name;
+      }
+    }
+
+    if (!bestAction && instance.set.defaultAction) {
+      bestAction = instance.set.defaultAction;
+    }
+
+    if (bestAction && bestAction !== instance.currentAction) {
+      const prevAction = instance.set.actions.find(a => a.name === instance.currentAction);
+      if (prevAction?.cooldown) {
+        instance.cooldowns.set(prevAction.name, prevAction.cooldown);
+      }
+      instance.currentAction = bestAction;
+      instance.actionTime = 0;
+    }
+
+    const active = instance.set.actions.find(a => a.name === instance.currentAction);
+    if (active) {
+      active.execute(eid, dt, ctx);
+    }
+    instance.actionTime += dt;
+
+    return instance.currentAction;
+  }
+
+  private scoreAction(eid: number, action: UtilityAction, ctx: UtilityContext): number {
+    if (action.considerations.length === 0) return 0;
+
+    let product = 1;
+    for (const c of action.considerations) {
+      const raw = c.score(eid, ctx);
+      const clamped = Math.max(0, Math.min(1, raw));
+      product *= clamped * c.weight;
+    }
+
+    return product;
+  }
+}
+
+export const ResponseCurves = {
+  linear: (x: number) => x,
+  quadratic: (x: number) => x * x,
+  inverse: (x: number) => 1 - x,
+  inverseQuadratic: (x: number) => 1 - x * x,
+  sigmoid: (x: number, k = 10) => 1 / (1 + Math.exp(-k * (x - 0.5))),
+  smoothstep: (x: number) => x * x * (3 - 2 * x),
+  threshold: (x: number, t = 0.5) => x >= t ? 1 : 0,
+  clamp: (value: number, min: number, max: number) => Math.max(min, Math.min(max, (value - min) / (max - min))),
+};

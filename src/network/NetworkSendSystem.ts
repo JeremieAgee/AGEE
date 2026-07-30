@@ -49,7 +49,7 @@ export class NetworkSendSystem extends System {
 
   private _currentTick = 0;
   private tickAccumulator = 0;
-  private _tickRate = NETWORK_CONSTANTS.SERVER_TICK_RATE;
+  private _tickRate: number = NETWORK_CONSTANTS.SERVER_TICK_RATE;
   private tickInterval = 1 / NETWORK_CONSTANTS.SERVER_TICK_RATE;
 
   private connectedClients = new Map<number, ConnectedClient>();
@@ -125,8 +125,16 @@ export class NetworkSendSystem extends System {
       this.pingAccumulator += dt;
       if (this.pingAccumulator >= this.pingInterval) {
         this.pingAccumulator -= this.pingInterval;
+        const timestamp = performance.now();
+        // Record the send timestamp on the transport itself (WebSocketTransport.sendPing())
+        // so receivePong() has something to measure RTT against — writing the raw Ping
+        // message alone never fed that timestamp into the transport's own RTT tracking.
+        const transportWithPing = this.transport as unknown as { sendPing?: () => void };
+        if (typeof transportWithPing.sendPing === "function") {
+          transportWithPing.sendPing();
+        }
         this.writer = new BinaryWriter(16);
-        writePing(this.writer, performance.now());
+        writePing(this.writer, timestamp);
         this.transport.send(this.writer.toArrayBuffer());
       }
     }

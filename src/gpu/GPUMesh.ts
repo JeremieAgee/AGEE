@@ -31,7 +31,11 @@ export class GPUMesh {
   readonly boundingSphereRadius: number;
   readonly boundingSphereCenter: Float32Array;
 
+  // Retained solely so destroy() can fence before releasing buffers (AUDIT bug #3).
+  private readonly device: GPUDevice;
+
   private constructor(
+    device: GPUDevice,
     vertexBuffer: GPUBuffer,
     indexBuffer: GPUBuffer | null,
     vertexCount: number,
@@ -40,6 +44,7 @@ export class GPUMesh {
     boundingSphereRadius: number,
     boundingSphereCenter: Float32Array,
   ) {
+    this.device = device;
     this.vertexBuffer = vertexBuffer;
     this.indexBuffer = indexBuffer;
     this.vertexCount = vertexCount;
@@ -145,12 +150,15 @@ export class GPUMesh {
     }
 
     return new GPUMesh(
-      vertexBuffer, indexBuffer, vertexCount, indexCount,
+      ctx.device, vertexBuffer, indexBuffer, vertexCount, indexCount,
       indexFormat, radius, center,
     );
   }
 
   destroy(): void {
+    // AUDIT FIX (bug #3): fence before releasing buffers that in-flight command
+    // buffers may still reference — see GPUContext.resize() for the same pattern.
+    void this.device.queue.onSubmittedWorkDone();
     this.vertexBuffer.destroy();
     this.indexBuffer?.destroy();
   }

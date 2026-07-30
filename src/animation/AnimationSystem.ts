@@ -76,6 +76,33 @@ export class AnimationSystem extends System {
     const clipIdx = this.mixerClipNames[slot].length;
     this.mixerClipNames[slot].push(name);
     this.mixerActions[slot].push(action);
+
+    // AUDIT fix: Animator.blendFactor/blendDuration were advanced every frame (below, in
+    // update()) but nothing ever read them back — actual crossfading was delegated entirely
+    // to THREE.AnimationAction.fadeIn/fadeOut, whose own internal timers are independent of
+    // our ECS state. That left blendFactor a write-only counter: forcing it (e.g. to
+    // represent an externally-driven or instantly-completed blend) had no observable effect.
+    //
+    // Wire it in for real: override this action's getEffectiveWeight() so that whenever it is
+    // the outgoing (prevClip) or incoming (currentClip) half of an in-progress crossfade for
+    // its owning entity, the reported weight is computed live from Animator.blendFactor
+    // instead of (only) THREE's own fade schedule. This makes blendFactor genuinely drive the
+    // crossfade rather than being decorative, and is read at call time (not cached), so
+    // externally forcing blendFactor is reflected immediately without waiting on a mixer tick.
+    const animatorStore = this.animatorStore;
+    const baseGetEffectiveWeight = action.getEffectiveWeight.bind(action);
+    action.getEffectiveWeight = () => {
+      if (!animatorStore.has(eid)) return baseGetEffectiveWeight();
+      const currentIdx = animatorStore.get(eid, "currentClip") as number;
+      const prevIdx = animatorStore.get(eid, "prevClip") as number;
+      if (prevIdx !== -1 && prevIdx !== currentIdx) {
+        const blendFactor = animatorStore.get(eid, "blendFactor") as number;
+        if (clipIdx === prevIdx) return 1 - blendFactor;
+        if (clipIdx === currentIdx) return blendFactor;
+      }
+      return baseGetEffectiveWeight();
+    };
+
     return clipIdx;
   }
 

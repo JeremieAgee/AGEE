@@ -41,11 +41,20 @@ export class AssetSystem extends System {
 
   load(handle: AssetHandle): Promise<any> {
     if (this.store.isLoaded(handle)) {
+      // Cache-hit path: this caller is a distinct owner of the reference and
+      // must retain just like a cold load does, or its later release() would
+      // over-release an asset another owner still holds.
+      this.store.retain(handle);
       return Promise.resolve(this.store.getData(handle));
     }
 
     const existing = this.inflight.get(handle);
-    if (existing) return existing;
+    if (existing) {
+      // Another caller's load is already in flight; this caller becomes a
+      // second owner of the same eventual result and must retain too.
+      this.store.retain(handle);
+      return existing;
+    }
 
     this.store.setLoading(handle);
     this.store.retain(handle);
@@ -110,6 +119,13 @@ export class AssetSystem extends System {
     if (shouldDispose) {
       const data = this.store.getData(handle);
       if (data?.dispose) data.dispose();
+      // Dependencies (e.g. a GLTF's registered meshes/materials/animations) were each
+      // retained once when this asset was loaded — release them symmetrically so their own
+      // refcounts can drop to zero and they get disposed too, instead of leaking forever.
+      const dependencies = this.store.getDependencies(handle);
+      for (const dep of dependencies) {
+        this.release(dep as AssetHandle);
+      }
       this.store.remove(handle);
       this.events?.emit("asset:disposed", handle);
     }

@@ -11,13 +11,12 @@ export function extractGeometry(geo: THREE.BufferGeometry): GPUMeshDescriptor {
   const positions = new Float32Array(geo.attributes.position.array);
 
   let normals: Float32Array | undefined;
-  if (geo.attributes.normal) {
-    normals = new Float32Array(geo.attributes.normal.array);
-  } else {
+  if (!geo.attributes.normal) {
     geo.computeVertexNormals();
-    if (geo.attributes.normal) {
-      normals = new Float32Array(geo.attributes.normal.array);
-    }
+  }
+  const normalAttr = geo.attributes.normal;
+  if (normalAttr) {
+    normals = new Float32Array(normalAttr.array);
   }
 
   let uvs: Float32Array | undefined;

@@ -1,5 +1,6 @@
 import { System, World, ComponentStore, defineComponent } from "../ecs";
 import { Transform } from "../core/Components";
+import { SpatialHash } from "../core/spatial/SpatialHash";
 
 export const SteeringAgent = defineComponent("SteeringAgent", {
   maxSpeed: "f32",
@@ -58,6 +59,15 @@ export class SteeringSystem extends System {
   private transformStore!: ComponentStore;
   private query!: ReturnType<World["query"]>;
 
+  // Spatial partition for the flocking (Separation/Alignment/Cohesion) neighbor search --
+  // previously an all-pairs O(n^2) scan with no use of the engine's SpatialHash. Rebuilt
+  // once per update() (positions move every frame) and queried per-entity instead of
+  // looping over every other steering entity.
+  private static readonly FLOCK_CELL_SIZE = 3;
+  private flockHash = new SpatialHash(SteeringSystem.FLOCK_CELL_SIZE);
+  private flockHashBuilt = false;
+  private flockCandidates: number[] = [];
+
   init(): void {
     this.steerStore = this.world.getStore(SteeringAgent);
     this.transformStore = this.world.getStore(Transform);
@@ -67,6 +77,8 @@ export class SteeringSystem extends System {
   update(dt: number): void {
     const entities = this.query.entities;
     if (entities.length === 0) return;
+
+    this.flockHashBuilt = false;
 
     const tx = this.transformStore.getColumn("x");
     const ty = this.transformStore.getColumn("y");
@@ -228,8 +240,26 @@ export class SteeringSystem extends System {
         const nRadiusSq = nRadius * nRadius;
         const myGroup = groupIds[eid];
 
-        for (let j = 0; j < entities.length; j++) {
-          const other = entities[j];
+        // Build the spatial hash lazily, once per update(), only if some entity actually
+        // needs flocking this frame -- rebuilt every frame since positions move.
+        if (!this.flockHashBuilt) {
+          this.flockHash.clear();
+          for (let k = 0; k < entities.length; k++) {
+            const e = entities[k];
+            this.flockHash.insert(e, tx[e], tz[e]);
+          }
+          this.flockHashBuilt = true;
+        }
+
+        // Query only nearby cells instead of scanning every other steering entity. The
+        // search radius is capped at the cell size so a pathologically large neighborRadius
+        // can't blow up the number of cells visited; the exact distSq check below still
+        // enforces the real neighborRadius against whatever candidates were found.
+        const searchRadius = Math.min(nRadius, SteeringSystem.FLOCK_CELL_SIZE);
+        const candidates = this.flockHash.queryRadius(px, pz, searchRadius, this.flockCandidates);
+
+        for (let j = 0; j < candidates.length; j++) {
+          const other = candidates[j];
           if (other === eid) continue;
           if (groupIds[other] !== myGroup) continue;
 

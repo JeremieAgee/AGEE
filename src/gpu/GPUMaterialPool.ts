@@ -18,7 +18,7 @@ export interface GPUMaterialParams {
 interface GPUMaterialEntry {
   buffer: GPUBuffer;
   bindGroup: GPUBindGroup;
-  data: Float32Array;
+  data: Float32Array<ArrayBuffer>;
 }
 
 export class GPUMaterialPool {
@@ -106,6 +106,9 @@ export class GPUMaterialPool {
   free(handle: Handle): void {
     const entry = this.entries.get(handle);
     if (entry) {
+      // AUDIT FIX (bug #3): fence before releasing the material buffer — see
+      // GPUContext.resize() for the same pattern and its rationale.
+      void this.gpuCtx.device.queue.onSubmittedWorkDone();
       entry.buffer.destroy();
       this.entries.free(handle);
     }

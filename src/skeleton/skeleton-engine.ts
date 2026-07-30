@@ -1,7 +1,7 @@
-import { World } from "../../external-engine-src/engine/ecs/World";
-import { PhysicsSystem } from "../../external-engine-src/engine/systems/PhysicsSystem";
-import { SkeletonSystem } from "../../external-engine-src/engine/skeleton/SkeletonSystem";
-import { Transform } from "../../external-engine-src/engine/core/Components";
+import { World } from "../ecs/World";
+import { PhysicsSystem } from "../systems/PhysicsSystem";
+import { SkeletonSystem } from "./SkeletonSystem";
+import { Transform } from "../core/Components";
 import {
   createHumanoid,
   animateHumanoidWalk,
@@ -9,7 +9,7 @@ import {
   updateHumanoidRagdoll,
   cleanupHumanoid,
   HumanoidBone,
-} from "../../external-engine-src/engine/skeleton/HumanoidFactory";
+} from "./HumanoidFactory";
 
 export interface SkeletonRuntime {
   world: World;

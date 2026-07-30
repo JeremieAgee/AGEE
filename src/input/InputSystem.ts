@@ -58,6 +58,8 @@ export class InputSystem extends System {
   init(): void {
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
+    window.addEventListener("blur", this.onWindowBlur);
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
     this.element.addEventListener("mousedown", this.onMouseDown);
     this.element.addEventListener("mouseup", this.onMouseUp);
     this.element.addEventListener("mousemove", this.onMouseMove);
@@ -203,9 +205,31 @@ export class InputSystem extends System {
     this.mouse.locked = document.pointerLockElement === this.element;
   };
 
+  // Without these, alt-tabbing (or switching tabs) while a key/button is held never fires the
+  // matching keyup/mouseup — since that happens outside the page — so isKeyDown() keeps
+  // reporting it held indefinitely after focus returns.
+  private onWindowBlur = (): void => {
+    this.releaseAllInputs();
+  };
+
+  private onVisibilityChange = (): void => {
+    if (document.hidden) this.releaseAllInputs();
+  };
+
+  private releaseAllInputs(): void {
+    for (const key of this.keysDown) this.keysReleased.add(key);
+    this.keysDown.clear();
+    this.keyPressBuffer.clear();
+
+    for (const button of this.mouse.buttons) this.mouseReleased.add(button);
+    this.mouse.buttons.clear();
+  }
+
   destroy(): void {
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("blur", this.onWindowBlur);
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
     this.element.removeEventListener("mousedown", this.onMouseDown);
     this.element.removeEventListener("mouseup", this.onMouseUp);
     this.element.removeEventListener("mousemove", this.onMouseMove);

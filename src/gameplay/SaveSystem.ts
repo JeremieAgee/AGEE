@@ -12,6 +12,12 @@ export interface SaveResult {
   error?: string;
 }
 
+// Version of the save wrapper itself (the `{ version, scene, slot }` envelope), independent
+// of SceneSerializer's own scene-format versioning. Bump this if the wrapper's shape changes
+// so load()/importSave() can reject or migrate saves written by an incompatible build instead
+// of silently misreading them.
+const SAVE_FORMAT_VERSION = 1;
+
 export class SaveSystem {
   private serializer: SceneSerializer;
   private storagePrefix: string;
@@ -28,6 +34,7 @@ export class SaveSystem {
     try {
       const scene = this.serializer.serialize(world, slot);
       const saveData = {
+        version: SAVE_FORMAT_VERSION,
         scene,
         slot: { name: slot, timestamp: Date.now(), metadata } as SaveSlot,
       };
@@ -95,6 +102,13 @@ export class SaveSystem {
       return { success: false, error: "Save data missing scene or entities" };
     }
 
+    // Wrapper written before this field existed is treated as version 0 (still loadable);
+    // a wrapper newer than this build understands is rejected rather than misread.
+    const version = typeof saveData.version === "number" ? saveData.version : 0;
+    if (version > SAVE_FORMAT_VERSION) {
+      return { success: false, error: `Save was written by a newer format (v${version}); this build supports up to v${SAVE_FORMAT_VERSION}` };
+    }
+
     try {
       const scene = saveData.scene as SerializedScene;
       this.serializer.deserialize(world, scene);
@@ -140,6 +154,10 @@ export class SaveSystem {
       const data = JSON.parse(text);
       if (!data.slot?.name) return { success: false, error: "Import file missing slot name" };
       if (!data.scene?.entities) return { success: false, error: "Import file missing scene data" };
+      const version = typeof data.version === "number" ? data.version : 0;
+      if (version > SAVE_FORMAT_VERSION) {
+        return { success: false, error: `Import file uses a newer save format (v${version}); this build supports up to v${SAVE_FORMAT_VERSION}` };
+      }
       localStorage.setItem(this.storagePrefix + data.slot.name, text);
       return { success: true, slot: data.slot.name };
     } catch {

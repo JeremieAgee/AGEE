@@ -77,13 +77,15 @@ export class ComponentStore<S extends ComponentSchema = ComponentSchema> {
   }
 
   add(entityId: number, data?: Partial<Record<keyof S, number | boolean | any>>): void {
-    if (this.entities.has(entityId)) return;
+    const alreadyPresent = this.entities.has(entityId);
 
     while (entityId >= this.capacity) {
       this.grow();
     }
 
-    this.entities.add(entityId);
+    if (!alreadyPresent) {
+      this.entities.add(entityId);
+    }
 
     if (data) {
       for (const [field, value] of Object.entries(data)) {
@@ -93,8 +95,13 @@ export class ComponentStore<S extends ComponentSchema = ComponentSchema> {
       }
     }
 
-    for (let i = 0; i < this.addCallbacks.length; i++) {
-      this.addCallbacks[i](entityId);
+    // Only fire onAdd for genuinely new rows — calling add() again on an entity that already
+    // has this component is an upsert (new `data` overwrites the existing fields) rather than
+    // a fresh add, so it must not re-trigger add-callbacks or re-run add-time side effects.
+    if (!alreadyPresent) {
+      for (let i = 0; i < this.addCallbacks.length; i++) {
+        this.addCallbacks[i](entityId);
+      }
     }
   }
 

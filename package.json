@@ -9,15 +9,21 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
     "three": "^0.170.0"
   },
   "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/three": "^0.170.0",
     "@webgpu/types": "^0.1.71",
+    "jsdom": "^30.0.1",
     "typescript": "^5.5.4",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^4.1.10"
   }
 }

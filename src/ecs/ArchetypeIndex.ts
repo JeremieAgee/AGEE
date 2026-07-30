@@ -28,7 +28,7 @@ export class ArchetypeIndex {
     this.removeFromArchetype(entityId, currentMask);
     this.addToArchetype(entityId, nextMask);
     this.entityMasks[entityId] = nextMask;
-    this._version++;
+    this.bumpIfRelevant(currentMask, nextMask);
   }
 
   addEntity(entityId: number): void {
@@ -36,19 +36,38 @@ export class ArchetypeIndex {
 
     this.addToArchetype(entityId, 0n);
     this.entityMasks[entityId] = 0n;
-    this._version++;
+    this.bumpIfRelevant(0n, 0n);
   }
 
   removeEntity(entityId: number): void {
     if (this.entityMasks[entityId] === undefined) return;
 
-    this.removeFromArchetype(entityId, this.entityMasks[entityId]);
+    const oldMask = this.entityMasks[entityId];
+    this.removeFromArchetype(entityId, oldMask);
     this.entityMasks[entityId] = undefined as any;
     this.entityPositions[entityId] = -1;
-    this._version++;
+    // An entity vanishing is always relevant to a 0n ("matches everything") query mask, and
+    // to any registered mask the entity used to satisfy.
+    this.bumpIfRelevant(oldMask, 0n);
   }
 
   private matchCache = new Map<bigint, { version: number; result: Archetype[] }>();
+
+  // Only bump the shared version counter when the archetype transition (oldMask -> newMask)
+  // could actually change the result of a query whose mask has been looked up before (i.e. is
+  // present as a key in matchCache). Previously `_version` was bumped unconditionally on every
+  // structural change anywhere, forcing every live query to rebuild its full match list even
+  // when the churn had nothing to do with that query's component mask. A query mask `m` is
+  // affected by this transition iff the entity was (or now is) part of an archetype that
+  // satisfies `m` — i.e. (oldMask & m) === m or (newMask & m) === m.
+  private bumpIfRelevant(oldMask: bigint, newMask: bigint): void {
+    for (const queryMask of this.matchCache.keys()) {
+      if ((oldMask & queryMask) === queryMask || (newMask & queryMask) === queryMask) {
+        this._version++;
+        return;
+      }
+    }
+  }
 
   matching(queryMask: bigint): Archetype[] {
     const cached = this.matchCache.get(queryMask);

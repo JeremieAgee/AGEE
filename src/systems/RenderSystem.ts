@@ -30,7 +30,7 @@ export class RenderSystem extends System {
   // migrated to the native path (particles, world-space UI, debug wireframes) still shows up;
   // meshes that GLTFPipeline has handed to the GPU path get MeshRenderer.visible=0 so they
   // aren't drawn twice. `active` is a manual kill-switch for the overlay pass itself.
-  private active = true;
+  active = true;
 
   constructor(canvas?: HTMLCanvasElement, backend: RenderBackend = "webgpu") {
     super();
@@ -41,7 +41,7 @@ export class RenderSystem extends System {
     this.renderer = useWebGPU
       ? new WebGPURenderer({ canvas, antialias: true, alpha: true })
       : new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.setClearColor(new THREE.Color(0x000000), 0);
 
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -124,7 +124,13 @@ export class RenderSystem extends System {
       mesh.position.set(tx[eid], ty[eid], tz[eid]);
       mesh.rotation.set(trx[eid], trY[eid], trz[eid]);
       mesh.scale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
-      mesh.visible = visibleCol[eid] !== 0;
+      // AUDIT FIX (bug #1): CullingSystem (priority 800) runs before this system
+      // (priority 900, same "render" phase) and computes real frustum-culling
+      // visibility into mesh.visible. Previously this line unconditionally
+      // overwrote that decision with the raw ECS MeshRenderer.visible flag every
+      // frame, discarding whatever CullingSystem had just decided. Combine both:
+      // the mesh is only shown when the raw flag AND the culling result agree.
+      mesh.visible = mesh.visible && visibleCol[eid] !== 0;
     }
 
     if (this.active && !this.postProcessActive) {

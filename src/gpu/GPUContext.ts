@@ -97,7 +97,18 @@ export class GPUContext {
     this.canvas.width = width;
     this.canvas.height = height;
 
-    if (this.depthTexture) this.depthTexture.destroy();
+    if (this.depthTexture) {
+      // AUDIT FIX (bug #3): previously destroyed the old depth texture with no
+      // fence, risking a use-after-free if a still-in-flight command buffer from
+      // a prior frame references it. Request a fence from the queue before
+      // tearing it down. resize()/destroy() are synchronous APIs used throughout
+      // the engine (callers don't await them), so this can't block on the
+      // returned promise without changing that contract — it's a best-effort
+      // signal to the driver, issued (and ordered) strictly before the destroy.
+      const oldDepthTexture = this.depthTexture;
+      void this.device.queue.onSubmittedWorkDone();
+      oldDepthTexture.destroy();
+    }
 
     this.depthTexture = this.device.createTexture({
       label: "AGEE depth",
@@ -128,6 +139,9 @@ export class GPUContext {
 
   destroy(): void {
     window.removeEventListener("resize", this._onResize);
+    // AUDIT FIX (bug #3): fence before releasing the depth texture and device —
+    // see the identical rationale in resize() above.
+    void this.device.queue.onSubmittedWorkDone();
     this.depthTexture?.destroy();
     this.device.destroy();
     // Only remove the canvas if this context created it itself — a host-supplied

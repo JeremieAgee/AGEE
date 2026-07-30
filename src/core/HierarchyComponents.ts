@@ -1,4 +1,4 @@
-import { defineComponent } from "../ecs";
+import { defineComponent } from "../ecs/Component";
 
 export const LocalTransform = defineComponent("LocalTransform", {
   x: "f32", y: "f32", z: "f32",
@@ -16,6 +16,12 @@ export const WorldTransform = defineComponent("WorldTransform", {
 
 export const Parent = defineComponent("Parent", {
   entity: "i32",
+  // Paired with `entity` so a stale reference (the parent entity was destroyed and its raw id
+  // recycled onto a brand-new, unrelated entity) can be detected by comparing against the
+  // World's live generation counter for that slot, the same generation/version scheme
+  // World.ts already tracks per entity id (see World.generation()/World's `generations`
+  // array) and that HandleAllocator uses for resource handles.
+  entityGeneration: "i32",
 });
 
 export const Children = defineComponent("Children", {

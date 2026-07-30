@@ -14,7 +14,7 @@ export class InterestManager {
   private _relevanceRadiusSq: number;
   private alwaysRelevant = new Set<number>();
 
-  constructor(world: World, relevanceRadius = NETWORK_CONSTANTS.DEFAULT_RELEVANCE_RADIUS) {
+  constructor(world: World, relevanceRadius: number = NETWORK_CONSTANTS.DEFAULT_RELEVANCE_RADIUS) {
     this.world = world;
     this._relevanceRadius = relevanceRadius;
     this._relevanceRadiusSq = relevanceRadius * relevanceRadius;

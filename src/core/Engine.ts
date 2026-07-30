@@ -307,6 +307,13 @@ export class AGEE {
       });
     }
 
+    if (__EDITOR__ && !this.headless) {
+      await this.initStep("editor", async () => {
+        const { EditorOverlay } = await import("../editor/EditorOverlay");
+        EditorOverlay.init(this);
+      });
+    }
+
     // Register entity destroy cleanup for Three.js objects
     this.world.onEntityDestroy((eid) => {
       const meshStore = this.world.getStore(MeshRenderer);

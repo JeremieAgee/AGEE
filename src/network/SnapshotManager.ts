@@ -238,9 +238,17 @@ export class SnapshotManager {
     }
 
     const despawns: number[] = [];
-    for (const [networkId] of networkIdToEntity) {
-      if (!seenIds.has(networkId)) {
-        despawns.push(networkId);
+    // An entirely empty snapshot carries no real information about which entities are still
+    // alive — it's what a lossy/fallback decode path produces when it can't reconstruct real
+    // state (e.g. a delta snapshot whose baseline went missing, see NetworkReceiveSystem's
+    // DeltaSnapshot handling). Treating "not present in this snapshot" as "despawned" is only
+    // valid when the snapshot actually reflects genuine server-authoritative state; an empty
+    // snapshot must never be able to mass-despawn every currently-known entity.
+    if (snapshot.entries.length > 0) {
+      for (const [networkId] of networkIdToEntity) {
+        if (!seenIds.has(networkId)) {
+          despawns.push(networkId);
+        }
       }
     }
 

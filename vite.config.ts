@@ -5,6 +5,8 @@ import { resolve } from "node:path";
 // examples/*/index.html. `vite dev` serves any of these by path with no extra config; `vite
 // build` needs each one listed explicitly as a rollup input.
 const exampleEntries = [
+  "lighting",
+  "destructible-brick-house",
   "basic-scene",
   "physics-ragdoll",
   "ai-agent",
@@ -13,6 +15,12 @@ const exampleEntries = [
 
 export default defineConfig({
   root: __dirname,
+  define: {
+    // Build-time flag gating editor-only code (scene builder, gizmos, inspector UI).
+    // Rollup dead-code-eliminates any `if (__EDITOR__)` branch when this resolves to false,
+    // and drops dynamic imports inside those branches from the production bundle entirely.
+    __EDITOR__: JSON.stringify(process.env.EDITOR === "true"),
+  },
   optimizeDeps: {
     // rapier3d-compat ships its own WASM loading; letting esbuild's dep pre-bundler touch it
     // in dev mode is a common source of "unreachable code" / WASM instantiation errors.

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AGEE — Examples</title>
+  <link rel="stylesheet" href="./examples/shared/style.css" />
+  <style>
+    body { overflow-y: auto; }
+    .page { max-width: 860px; margin: 0 auto; padding: 48px 24px 80px; }
+    .page h1 { font-size: 26px; margin-bottom: 4px; }
+    .page > p { color: var(--text-dim); margin-top: 0; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 14px;
+      margin-top: 24px;
+    }
+    .card {
+      display: block;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      text-decoration: none;
+      color: var(--text);
+    }
+    .card:hover { border-color: var(--accent); }
+    .card h2 { margin: 0 0 6px; font-size: 15px; }
+    .card p { margin: 0; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+    .badge.live { background: rgba(74,255,145,0.15); color: #4fa; }
+    .badge.soon { background: rgba(255,255,255,0.08); color: var(--text-dim); }
+    .note { margin-top: 32px; font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+    .note code { font-family: var(--mono); background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>AGEE</h1>
+    <p>Adaptive Game Engine Environment — example scenes.</p>
+
+    <div class="grid">
+      <a class="card" href="./examples/lighting/index.html">
+        <span class="badge live">LIVE</span>
+        <h2>Lighting</h2>
+        <p>Ambient, directional, point, and spot lights on PBR materials — toggle each one independently.</p>
+      </a>
+      <a class="card" href="./examples/destructible-brick-house/index.html">
+        <span class="badge live">LIVE</span>
+        <h2>Destructible Brick House</h2>
+        <p>A physics-built brick house you can knock down with a wrecking ball fired from the camera.</p>
+      </a>
+      <a class="card" href="./examples/basic-scene/index.html">
+        <span class="badge soon">SOON</span>
+        <h2>Basic Scene</h2>
+        <p>Minimal engine bring-up — one entity, one light, one camera.</p>
+      </a>
+      <a class="card" href="./examples/physics-ragdoll/index.html">
+        <span class="badge soon">SOON</span>
+        <h2>Physics Ragdoll</h2>
+        <p>Animated ↔ physics-driven humanoid via the skeleton system.</p>
+      </a>
+      <a class="card" href="./examples/ai-agent/index.html">
+        <span class="badge soon">SOON</span>
+        <h2>AI Agent</h2>
+        <p>Behavior Tree / Utility AI decision-making on display.</p>
+      </a>
+      <a class="card" href="./examples/networking/index.html">
+        <span class="badge soon">SOON</span>
+        <h2>Networking</h2>
+        <p>Client/server replication over the loopback or WebSocket transport.</p>
+      </a>
+    </div>
+
+    <p class="note">
+      Live examples run in <code>__EDITOR__</code> mode during <code>npm run dev</code>: press
+      <code>I</code> for the scene inspector, <code>F3</code> for the perf overlay, and
+      <code>`</code> for the dev console. WebGPU support is required
+      (current Chrome or Edge).
+    </p>
+  </div>
+</body>
+</html>

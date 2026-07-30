@@ -2,6 +2,7 @@ import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { System, World, ComponentStore } from "../ecs";
 import { Transform, RigidBody, Collider, MeshRenderer, Velocity } from "../core/Components";
+import { Quat } from "../core/math/Quat";
 
 export interface RaycastHit {
   entityId: number;
@@ -68,7 +69,12 @@ export class PhysicsSystem extends System {
   private initialized = false;
   private accumulator = 0;
   private fixedStep = 1 / 60;
-  private maxSubSteps = 4;
+  // Safety cap on how many fixed substeps a single update() call will run, so a genuine
+  // spiral-of-death (e.g. a long debugger pause) can't block the main thread simulating
+  // thousands of steps synchronously. Deliberately generous relative to a single dropped
+  // frame at 60Hz (a ~12fps single frame needs 5 substeps) so ordinary frame-rate variance
+  // never gets truncated — see the AUDIT fix below for what happens when it IS hit.
+  private maxSubSteps = 8;
   private eventQueue!: RAPIER.EventQueue;
 
   private transformStore!: ComponentStore;
@@ -93,7 +99,20 @@ export class PhysicsSystem extends System {
   private currPosX: Float32Array = new Float32Array(INITIAL_CAPACITY);
   private currPosY: Float32Array = new Float32Array(INITIAL_CAPACITY);
   private currPosZ: Float32Array = new Float32Array(INITIAL_CAPACITY);
+
+  // Interpolation: previous/current-step rotations, mirroring prevPos/currPos so rotation is
+  // slerped by the same alpha instead of snapping straight to the latest body.rotation().
+  private prevRotX: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private prevRotY: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private prevRotZ: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private prevRotW: Float32Array = new Float32Array(INITIAL_CAPACITY).fill(1);
+  private currRotX: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private currRotY: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private currRotZ: Float32Array = new Float32Array(INITIAL_CAPACITY);
+  private currRotW: Float32Array = new Float32Array(INITIAL_CAPACITY).fill(1);
   private _interpolationAlpha = 0;
+  private _tmpPrevQuat = new Quat();
+  private _tmpCurrQuat = new Quat();
 
   // Reverse index: collider handle → entity ID (derived, not authoritative)
   private colliderToEntity = new Map<number, number>();
@@ -138,6 +157,17 @@ export class PhysicsSystem extends System {
     this.currPosX = new Float32Array(this.capacity); this.currPosX.set(oldCurrX);
     this.currPosY = new Float32Array(this.capacity); this.currPosY.set(oldCurrY);
     this.currPosZ = new Float32Array(this.capacity); this.currPosZ.set(oldCurrZ);
+
+    const oldPrevRX = this.prevRotX, oldPrevRY = this.prevRotY, oldPrevRZ = this.prevRotZ, oldPrevRW = this.prevRotW;
+    const oldCurrRX = this.currRotX, oldCurrRY = this.currRotY, oldCurrRZ = this.currRotZ, oldCurrRW = this.currRotW;
+    this.prevRotX = new Float32Array(this.capacity); this.prevRotX.set(oldPrevRX);
+    this.prevRotY = new Float32Array(this.capacity); this.prevRotY.set(oldPrevRY);
+    this.prevRotZ = new Float32Array(this.capacity); this.prevRotZ.set(oldPrevRZ);
+    this.prevRotW = new Float32Array(this.capacity).fill(1); this.prevRotW.set(oldPrevRW);
+    this.currRotX = new Float32Array(this.capacity); this.currRotX.set(oldCurrRX);
+    this.currRotY = new Float32Array(this.capacity); this.currRotY.set(oldCurrRY);
+    this.currRotZ = new Float32Array(this.capacity); this.currRotZ.set(oldCurrRZ);
+    this.currRotW = new Float32Array(this.capacity).fill(1); this.currRotW.set(oldCurrRW);
   }
 
   async initRapier(): Promise<void> {
@@ -232,15 +262,31 @@ export class PhysicsSystem extends System {
     // Initialize interpolation state
     this.prevPosX[eid] = tx; this.prevPosY[eid] = ty; this.prevPosZ[eid] = tz;
     this.currPosX[eid] = tx; this.currPosY[eid] = ty; this.currPosZ[eid] = tz;
+    const initialRot = body.rotation();
+    this.prevRotX[eid] = initialRot.x; this.prevRotY[eid] = initialRot.y;
+    this.prevRotZ[eid] = initialRot.z; this.prevRotW[eid] = initialRot.w;
+    this.currRotX[eid] = initialRot.x; this.currRotY[eid] = initialRot.y;
+    this.currRotZ[eid] = initialRot.z; this.currRotW[eid] = initialRot.w;
 
-    const mass = this.rigidBodyStore.has(eid) ? this.rigidBodyStore.get(eid, "mass") : 1;
-    this.world.addComponent(eid, RigidBody, {
-      bodyHandle: body.handle,
-      bodyType,
-      mass: mass || 1,
-      restitution: 0.3,
-      friction: 0.5,
-    });
+    // AUDIT fix: this used to unconditionally (re-)write mass/restitution/friction with
+    // hardcoded defaults via world.addComponent(), which — because ComponentStore.add() only
+    // writes fields the FIRST time an entity is registered — permanently locked in those
+    // defaults whenever addBody() happened to be the thing that first created the RigidBody
+    // component. A caller's later, more specific world.addComponent(eid, RigidBody, {...})
+    // call would then silently no-op, so intents like mass:0 (density-derived) or a custom
+    // restitution/friction could never actually take effect.
+    //
+    // Fix: never let addBody() be the one to "lock in" caller-owned physical values. If the
+    // component already exists (the normal/expected flow — callers add RigidBody with their
+    // intended values before calling addBody()), only update the fields addBody() itself
+    // owns (bodyHandle/bodyType) via direct store.set(), which writes regardless of prior
+    // registration. If it doesn't exist yet, DON'T create it with hardcoded values here —
+    // leave that to the caller (or ensureMeshColliders(), which now creates it explicitly)
+    // so their first, real world.addComponent() call is the one that sticks.
+    if (this.rigidBodyStore.has(eid)) {
+      this.rigidBodyStore.set(eid, "bodyHandle", body.handle);
+      this.rigidBodyStore.set(eid, "bodyType", bodyType);
+    }
 
     return body;
   }
@@ -303,7 +349,16 @@ export class PhysicsSystem extends System {
 
     const collider = this.rapierWorld.createCollider(colliderDesc, body);
     this.ensureCapacity(eid);
-    this.colliders[eid] = collider;
+    // AUDIT fix: colliders[eid] is a single-slot "primary collider" pointer used by
+    // getCollider(); trackCollider() already maintains the full per-entity handle list for
+    // everything Rapier-facing (raycasts, overlaps, etc). Previously this unconditionally
+    // overwrote the slot, so adding a second collider/trigger to an entity silently orphaned
+    // the first one from getCollider()'s point of view even though Rapier kept simulating it.
+    // Only claim the slot if nothing is there yet, so the first collider added stays the one
+    // getCollider() resolves to.
+    if (!this.colliders[eid]) {
+      this.colliders[eid] = collider;
+    }
     this.trackCollider(eid, collider);
 
     this.world.addComponent(eid, Collider, {
@@ -330,6 +385,12 @@ export class PhysicsSystem extends System {
       if (!bounds) continue;
 
       if (!this.rigidBodyStore.has(eid)) {
+        // addBody() no longer creates the RigidBody component with hardcoded defaults on
+        // behalf of a caller (see AUDIT fix in addBody()) — since this is the one legitimate
+        // "no one else will ever add it" path (auto-derived mesh colliders), create it here.
+        this.world.addComponent(eid, RigidBody, {
+          bodyType: 1, mass: 1, restitution: 0.3, friction: 0.5,
+        });
         this.addBody(eid, "fixed");
       } else if (!this.bodies[eid]) {
         const bodyType = this.rigidBodyStore.get(eid, "bodyType");
@@ -727,7 +788,7 @@ export class PhysicsSystem extends System {
     this.accumulator += dt;
     let steps = 0;
     while (this.accumulator >= this.fixedStep && steps < this.maxSubSteps) {
-      // Snapshot current positions as "previous" before stepping
+      // Snapshot current positions/rotations as "previous" before stepping
       for (let i = 0; i < entities.length; i++) {
         const eid = entities[i];
         const body = this.bodies[eid];
@@ -737,13 +798,18 @@ export class PhysicsSystem extends System {
         this.prevPosX[eid] = pos.x;
         this.prevPosY[eid] = pos.y;
         this.prevPosZ[eid] = pos.z;
+        const rot = body.rotation();
+        this.prevRotX[eid] = rot.x;
+        this.prevRotY[eid] = rot.y;
+        this.prevRotZ[eid] = rot.z;
+        this.prevRotW[eid] = rot.w;
       }
 
       this.rapierWorld.step(this.eventQueue);
       this.accumulator -= this.fixedStep;
       steps++;
 
-      // Snapshot new positions as "current"
+      // Snapshot new positions/rotations as "current"
       for (let i = 0; i < entities.length; i++) {
         const eid = entities[i];
         const body = this.bodies[eid];
@@ -752,11 +818,21 @@ export class PhysicsSystem extends System {
         this.currPosX[eid] = pos.x;
         this.currPosY[eid] = pos.y;
         this.currPosZ[eid] = pos.z;
+        const rot = body.rotation();
+        this.currRotX[eid] = rot.x;
+        this.currRotY[eid] = rot.y;
+        this.currRotZ[eid] = rot.z;
+        this.currRotW[eid] = rot.w;
       }
     }
-    if (steps >= this.maxSubSteps) {
-      this.accumulator = 0;
-    }
+    // AUDIT fix: this used to unconditionally zero the accumulator whenever the substep cap
+    // was hit (`if (steps >= this.maxSubSteps) this.accumulator = 0;`), silently discarding
+    // whatever leftover simulation time hadn't been consumed yet. That made the same total
+    // elapsed wall-clock time simulate a different number of physics steps depending on how
+    // it was chopped into frames/calls — not reproducible / not frame-rate independent.
+    // Simply leaving the leftover in place (instead of resetting it) carries it into the
+    // next update() call so it still eventually gets simulated, converging on the same
+    // result regardless of call granularity.
 
     // Compute interpolation alpha from remaining accumulator
     this._interpolationAlpha = this.accumulator / this.fixedStep;
@@ -804,8 +880,14 @@ export class PhysicsSystem extends System {
       ty[eid] = this.prevPosY[eid] + (this.currPosY[eid] - this.prevPosY[eid]) * a;
       tz[eid] = this.prevPosZ[eid] + (this.currPosZ[eid] - this.prevPosZ[eid]) * a;
 
-      const rot = body.rotation();
-      quaternionToEuler(rot.x, rot.y, rot.z, rot.w, eulerOut);
+      // AUDIT fix: rotation used to be assigned straight from the latest body.rotation(),
+      // ignoring interpolationAlpha entirely — a rotating body's Transform would visibly
+      // "pop" between physics steps instead of interpolating smoothly like position does.
+      // Slerp between the previous and current step's rotation by the same alpha used above.
+      this._tmpPrevQuat.set(this.prevRotX[eid], this.prevRotY[eid], this.prevRotZ[eid], this.prevRotW[eid]);
+      this._tmpCurrQuat.set(this.currRotX[eid], this.currRotY[eid], this.currRotZ[eid], this.currRotW[eid]);
+      this._tmpPrevQuat.slerp(this._tmpCurrQuat, a);
+      quaternionToEuler(this._tmpPrevQuat.x, this._tmpPrevQuat.y, this._tmpPrevQuat.z, this._tmpPrevQuat.w, eulerOut);
       trx[eid] = eulerOut[0];
       trY[eid] = eulerOut[1];
       trz[eid] = eulerOut[2];

@@ -16,6 +16,11 @@ export interface TerrainConfig {
   // caps how many chunks load() actually does per update() call, spreading the rest across
   // subsequent frames (closest chunks first).
   maxChunkLoadsPerFrame: number;
+  // Wall-clock backstop alongside maxChunkLoadsPerFrame: a single chunk (e.g. full-res LOD
+  // near the camera, with a trimesh collider) can cost far more than the "average" chunk, so
+  // a count-only budget can still blow the frame. Loading stops early once this many
+  // milliseconds have elapsed this update() call, even if the count budget isn't exhausted.
+  maxChunkLoadMs: number;
 }
 
 const DEFAULT_TERRAIN_CONFIG: TerrainConfig = {
@@ -26,6 +31,7 @@ const DEFAULT_TERRAIN_CONFIG: TerrainConfig = {
   noise: {},
   colliders: true,
   maxChunkLoadsPerFrame: 2,
+  maxChunkLoadMs: 4,
 };
 
 const MAX_CHUNKS = 512;
@@ -48,6 +54,11 @@ export class TerrainSystem extends System {
   private chunkMeshes: (THREE.Mesh | null)[];
   private chunkBodies: (RAPIER.RigidBody | null)[];
   private chunkColliders: (RAPIER.Collider | null)[];
+  // Actual mesh resolution used for each chunk, which may be lower than
+  // config.resolution for distant chunks (see computeLODResolution()). Needed
+  // by getHeightAt()/createChunkCollider() to interpret each chunk's heightmap
+  // with the resolution it was actually generated at.
+  private chunkResolutions: number[];
   private maxChunks: number;
   private chunkCount = 0;
   private freeSlots: number[] = [];
@@ -77,6 +88,7 @@ export class TerrainSystem extends System {
     this.chunkMeshes = new Array(this.maxChunks).fill(null);
     this.chunkBodies = new Array(this.maxChunks).fill(null);
     this.chunkColliders = new Array(this.maxChunks).fill(null);
+    this.chunkResolutions = new Array(this.maxChunks).fill(this.config.resolution);
   }
 
   setScene(scene: THREE.Scene): void { this.scene = scene; }
@@ -115,11 +127,13 @@ export class TerrainSystem extends System {
     this.chunkMeshes.length = newMax;
     this.chunkBodies.length = newMax;
     this.chunkColliders.length = newMax;
+    this.chunkResolutions.length = newMax;
     for (let i = this.maxChunks; i < newMax; i++) {
       this.chunkHeightmaps[i] = null!;
       this.chunkMeshes[i] = null;
       this.chunkBodies[i] = null;
       this.chunkColliders[i] = null;
+      this.chunkResolutions[i] = this.config.resolution;
     }
     this.maxChunks = newMax;
   }
@@ -136,7 +150,7 @@ export class TerrainSystem extends System {
     const hm = this.chunkHeightmaps[slot];
     if (!hm) return this.noise.sample(worldX, worldZ);
 
-    const res = this.config.resolution;
+    const res = this.chunkResolutions[slot];
     const localX = worldX - cx * cs;
     const localZ = worldZ - cz * cs;
     const fx = (localX / cs) * (res - 1);
@@ -217,12 +231,72 @@ export class TerrainSystem extends System {
     }
   }
 
+  // Distance-based level of detail: chunks farther from the camera/reference
+  // point are meshed at a coarser resolution than nearby ones. Thresholds are
+  // expressed as multiples of chunkSize so behavior scales with chunk size.
+  private computeLODResolution(distance: number): number {
+    const cs = this.config.chunkSize;
+    const base = this.config.resolution;
+
+    if (distance < cs * 4) return base;
+    if (distance < cs * 16) return Math.max(3, Math.round((base - 1) / 2) + 1);
+    return Math.max(2, Math.round((base - 1) / 4) + 1);
+  }
+
+  // Computes per-vertex normals from the height field analytically (central
+  // differences of world-space height samples) instead of averaging face
+  // normals of the local mesh only. Any sample that falls outside this
+  // chunk's own heightmap is pulled from the shared noise function at that
+  // exact world position rather than from the neighboring chunk's heightmap
+  // array, so two adjacent chunks evaluate identical world-space height
+  // samples on either side of their shared edge and therefore produce
+  // matching (seamless) normals at the boundary, even though each chunk
+  // builds its geometry independently.
+  private computeHeightFieldNormals(
+    hm: Float32Array,
+    res: number,
+    worldX: number,
+    worldZ: number,
+    step: number
+  ): Float32Array {
+    const normals = new Float32Array(res * res * 3);
+
+    for (let z = 0; z < res; z++) {
+      for (let x = 0; x < res; x++) {
+        const hL = x > 0 ? hm[z * res + (x - 1)] : this.noise.sample(worldX + (x - 1) * step, worldZ + z * step);
+        const hR = x < res - 1 ? hm[z * res + (x + 1)] : this.noise.sample(worldX + (x + 1) * step, worldZ + z * step);
+        const hD = z > 0 ? hm[(z - 1) * res + x] : this.noise.sample(worldX + x * step, worldZ + (z - 1) * step);
+        const hU = z < res - 1 ? hm[(z + 1) * res + x] : this.noise.sample(worldX + x * step, worldZ + (z + 1) * step);
+
+        const dhdx = (hR - hL) / (2 * step);
+        const dhdz = (hU - hD) / (2 * step);
+
+        const nx = -dhdx;
+        const ny = 1;
+        const nz = -dhdz;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+
+        const i = (z * res + x) * 3;
+        normals[i] = nx / len;
+        normals[i + 1] = ny / len;
+        normals[i + 2] = nz / len;
+      }
+    }
+
+    return normals;
+  }
+
   private loadChunk(cx: number, cz: number): void {
     const slot = this.allocSlot();
     const cs = this.config.chunkSize;
-    const res = this.config.resolution;
     const worldX = cx * cs;
     const worldZ = cz * cs;
+
+    const centerX = worldX + cs / 2;
+    const centerZ = worldZ + cs / 2;
+    const distance = Math.hypot(centerX - this.cameraX, centerZ - this.cameraZ);
+    const res = this.computeLODResolution(distance);
+    this.chunkResolutions[slot] = res;
 
     this.chunkCX[slot] = cx;
     this.chunkCZ[slot] = cz;
@@ -258,10 +332,12 @@ export class TerrainSystem extends System {
       }
     }
 
+    const normals = this.computeHeightFieldNormals(hm, res, worldX, worldZ, step);
+
     geo.setIndex(indices);
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-    geo.computeVertexNormals();
+    geo.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 
     const mesh = new THREE.Mesh(geo, this.material);
     mesh.position.set(worldX, 0, worldZ);
@@ -271,17 +347,16 @@ export class TerrainSystem extends System {
 
     // Build physics collider
     if (this.config.colliders && this.rapierWorld) {
-      this.createChunkCollider(slot, cx, cz, hm);
+      this.createChunkCollider(slot, cx, cz, hm, res);
     }
 
     this.coordToSlot.set(`${cx},${cz}`, slot);
   }
 
-  private createChunkCollider(slot: number, cx: number, cz: number, hm: Float32Array): void {
+  private createChunkCollider(slot: number, cx: number, cz: number, hm: Float32Array, res: number): void {
     if (!this.rapierWorld) return;
 
     const cs = this.config.chunkSize;
-    const res = this.config.resolution;
     const step = cs / (res - 1);
     const worldX = cx * cs;
     const worldZ = cz * cs;

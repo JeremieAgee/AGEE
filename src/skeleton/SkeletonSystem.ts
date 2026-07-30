@@ -2,6 +2,7 @@ import RAPIER from "@dimforge/rapier3d-compat";
 import { System, ComponentStore } from "../ecs";
 import { Handle, HandleMap } from "../core/handles/Handle";
 import { Quat } from "../core/math/Quat";
+import { Vec3 } from "../core/math/Vec3";
 import { Transform, RigidBody } from "../core/Components";
 import { PhysicsSystem } from "../systems/PhysicsSystem";
 import { SkeletonDefinition, BoneConfig, BoneFlags, ColliderType } from "./SkeletonDefinition";
@@ -383,6 +384,77 @@ export class SkeletonSystem extends System {
 
         instance.dirtyFlags[i] &= ~DirtyFlags.WORLD;
       }
+    }
+
+    // AUDIT fix: the loop above only ever writes bone world transforms by reading back
+    // Rapier ragdoll body transforms for instances in activeInstances (populated only by
+    // activate(), which requires a live PhysicsSystem and spawns real rigid bodies per bone).
+    // There was no forward-kinematics evaluator composing SkeletonDefinition.parents + local
+    // poses into world poses for a purely-animated (non-ragdolled) instance, so
+    // setBoneLocalPose()/getBoneWorldPose() had no effect at all unless the instance had been
+    // physically activated. Run real FK for every instance that ISN'T currently ragdolled.
+    this.instances.forEach((instance) => {
+      if (instance.active) return; // ragdolled — handled by the physics-readback loop above
+      const def = this.definitions.get(instance.definitionHandle);
+      if (!def) return;
+      this.evaluateForwardKinematics(def, instance);
+    });
+  }
+
+  // Walks the bone hierarchy in parent-before-child order (via the firstChild/nextSibling
+  // linked lists SkeletonDefinition already builds from parentIndex) composing each bone's
+  // world transform from its parent's already-computed world transform and its own local
+  // pose. Root bones (parentIndex === -1) have world pose === local pose.
+  private evaluateForwardKinematics(def: SkeletonDefinition, instance: SkeletonInstance): void {
+    for (let i = 0; i < def.boneCount; i++) {
+      if (def.parents[i] === -1) {
+        this.evaluateBoneFK(def, instance, i);
+      }
+    }
+  }
+
+  private evaluateBoneFK(def: SkeletonDefinition, instance: SkeletonInstance, boneIndex: number): void {
+    const parentIdx = def.parents[boneIndex];
+    const localRot = new Quat(
+      instance.localRotX[boneIndex], instance.localRotY[boneIndex],
+      instance.localRotZ[boneIndex], instance.localRotW[boneIndex]
+    );
+
+    if (parentIdx === -1) {
+      instance.worldPosX[boneIndex] = instance.localPosX[boneIndex];
+      instance.worldPosY[boneIndex] = instance.localPosY[boneIndex];
+      instance.worldPosZ[boneIndex] = instance.localPosZ[boneIndex];
+      instance.worldRotX[boneIndex] = localRot.x;
+      instance.worldRotY[boneIndex] = localRot.y;
+      instance.worldRotZ[boneIndex] = localRot.z;
+      instance.worldRotW[boneIndex] = localRot.w;
+    } else {
+      const parentRot = new Quat(
+        instance.worldRotX[parentIdx], instance.worldRotY[parentIdx],
+        instance.worldRotZ[parentIdx], instance.worldRotW[parentIdx]
+      );
+      const localPos = new Vec3(
+        instance.localPosX[boneIndex], instance.localPosY[boneIndex], instance.localPosZ[boneIndex]
+      );
+      const rotatedLocalPos = parentRot.rotateVec3(localPos);
+
+      instance.worldPosX[boneIndex] = instance.worldPosX[parentIdx] + rotatedLocalPos.x;
+      instance.worldPosY[boneIndex] = instance.worldPosY[parentIdx] + rotatedLocalPos.y;
+      instance.worldPosZ[boneIndex] = instance.worldPosZ[parentIdx] + rotatedLocalPos.z;
+
+      const worldRot = parentRot.clone().multiply(localRot);
+      instance.worldRotX[boneIndex] = worldRot.x;
+      instance.worldRotY[boneIndex] = worldRot.y;
+      instance.worldRotZ[boneIndex] = worldRot.z;
+      instance.worldRotW[boneIndex] = worldRot.w;
+    }
+
+    instance.dirtyFlags[boneIndex] &= ~(DirtyFlags.WORLD | DirtyFlags.LOCAL);
+
+    let child = def.firstChild[boneIndex];
+    while (child !== -1) {
+      this.evaluateBoneFK(def, instance, child);
+      child = def.nextSibling[child];
     }
   }
 

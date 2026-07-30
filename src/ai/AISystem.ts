@@ -217,6 +217,20 @@ export class AISystem extends System {
         bb.set("x", tx[eid]);
         bb.set("y", ty[eid]);
         bb.set("z", tz[eid]);
+
+        // Bridge Perception (if present) into the blackboard so BT/FSM/GOAP/Utility
+        // condition and action functions can read hasTarget/alertLevel/etc. directly
+        // instead of every user-authored function having to reach into
+        // world.getStore(Perception) itself. "bool"-typed component fields come back as
+        // raw 0/1 from ComponentStore, so hasTarget is coerced to an actual boolean.
+        if (this.perceptionStore.has(eid)) {
+          bb.set("hasTarget", this.perceptionStore.get(eid, "hasTarget") === 1);
+          bb.set("targetEntity", this.perceptionStore.get(eid, "targetEntity"));
+          bb.set("alertLevel", this.perceptionStore.get(eid, "alertLevel"));
+          bb.set("targetLastX", this.perceptionStore.get(eid, "targetLastX"));
+          bb.set("targetLastY", this.perceptionStore.get(eid, "targetLastY"));
+          bb.set("targetLastZ", this.perceptionStore.get(eid, "targetLastZ"));
+        }
       }
 
       switch (type) {

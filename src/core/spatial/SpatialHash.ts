@@ -1,17 +1,20 @@
 export class SpatialHash {
   private cellSize: number;
   private invCellSize: number;
-  private cells = new Map<number, number[]>();
-  private entityCell = new Map<number, number>();
+  private cells = new Map<string, number[]>();
+  private entityCell = new Map<number, string>();
 
   constructor(cellSize: number = 16) {
     this.cellSize = cellSize;
     this.invCellSize = 1 / cellSize;
   }
 
-  private hash(cx: number, cz: number): number {
-    const h1 = (cx * 92837111) ^ (cz * 689287499);
-    return (h1 >>> 0);
+  // A lossy 32-bit XOR-merge of (cx,cz) can collide for cell coordinates that are nowhere
+  // near each other (e.g. (-387,48) and (-374,-25) collide despite being ~1186 world units
+  // apart at cellSize=16), silently leaking entities from an unrelated cell into a query.
+  // A string key built from the exact integer coordinates has no such collisions.
+  private hash(cx: number, cz: number): string {
+    return cx + "," + cz;
   }
 
   private cellCoord(v: number): number {

@@ -99,24 +99,20 @@ export class EventJournal {
   flush(): void {
     this.flushing = true;
 
-    while (this.queue.length > 0) {
+    while (this.queue.length > 0 || this.swapQueue.length > 0) {
+      if (this.queue.length === 0) {
+        // Pull in events emitted re-entrantly (by a listener during the previous batch's
+        // dispatch) so they get drained within this same flush() call instead of being
+        // silently dropped.
+        this.queue = this.swapQueue;
+        this.swapQueue = [];
+      }
+
       const batch = this.queue;
-      this.queue = this.swapQueue;
-      this.swapQueue = [];
+      this.queue = [];
 
       for (let i = 0; i < batch.length; i++) {
         this.dispatch(batch[i].eventId, batch[i].payload);
-      }
-
-      batch.length = 0;
-      this.swapQueue = batch;
-    }
-
-    if (this.swapQueue.length > 0) {
-      const remaining = this.swapQueue;
-      this.swapQueue = [];
-      for (let i = 0; i < remaining.length; i++) {
-        this.queue.push(remaining[i]);
       }
     }
 

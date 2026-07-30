@@ -48,6 +48,17 @@ export class GLTFPipeline {
     const gltfHandle = this.assets.registerGLTF(id, path);
     this.assets.store.setLoading(gltfHandle);
 
+    try {
+      return await this.loadAndRegister(gltfHandle, id, path);
+    } catch (err) {
+      // Without this, a failed fetch/parse leaves the asset stuck in LoadStatus.Loading
+      // forever — isReady()/getStatus() callers never see it transition to Failed.
+      this.assets.store.setFailed(gltfHandle, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  }
+
+  private async loadAndRegister(gltfHandle: AssetHandle, id: AssetId, path: string): Promise<GLTFAsset> {
     const gltf = await this.loadRaw(path);
 
     const result: GLTFAsset = {

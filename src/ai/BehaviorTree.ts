@@ -43,6 +43,64 @@ export class BehaviorTreeRunner {
   private subtrees = new Map<string, BTNode>();
   private runningChildKey = "__bt_running_";
 
+  // Per-node-instance identity: two structurally distinct BTNode objects that happen to
+  // share the same `name` (e.g. two independently-authored "patrol" sequences nested under
+  // a Parallel) must never collide on the same blackboard key. Ids are assigned lazily,
+  // first-seen node for a given name keeps the bare name (so existing single-instance
+  // trees keep their familiar "__bt_running_<name>" keys); any later node sharing that name
+  // gets a disambiguating suffix.
+  private nodeIds = new WeakMap<BTNode, string>();
+  private claimedNames = new Set<string>();
+  private nameCollisions = new Map<string, number>();
+
+  private getNodeId(node: BTNode): string {
+    let id = this.nodeIds.get(node);
+    if (id !== undefined) return id;
+    const base = node.name;
+    if (!this.claimedNames.has(base)) {
+      this.claimedNames.add(base);
+      id = base;
+    } else {
+      const n = (this.nameCollisions.get(base) ?? 1) + 1;
+      this.nameCollisions.set(base, n);
+      id = `${base}#${n}`;
+    }
+    this.nodeIds.set(node, id);
+    return id;
+  }
+
+  private runningKey(node: BTNode): string {
+    return this.runningChildKey + this.getNodeId(node);
+  }
+
+  private shadowKey(node: BTNode): string {
+    return this.runningKey(node) + "$shadow";
+  }
+
+  private resetFlagKey(node: BTNode): string {
+    return this.runningKey(node) + "$reset";
+  }
+
+  // If `node` has been marked for reset (because its parent moved on from it without it
+  // ever naturally completing -- e.g. an external abort/interrupt switched a Selector to a
+  // different branch), clear its own running/shadow state so it starts fresh next tick, and
+  // cascade the mark down to its children so any nested running-state is cleared too, lazily,
+  // as each of them is next reached.
+  private consumeResetFlag(node: BTNode, bb: Blackboard): void {
+    const flag = this.resetFlagKey(node);
+    if (!bb.get<boolean>(flag)) return;
+    bb.delete(flag);
+    bb.delete(this.runningKey(node));
+    bb.delete(this.shadowKey(node));
+    if (node.children) {
+      for (const child of node.children) this.markForReset(child, bb);
+    }
+  }
+
+  private markForReset(node: BTNode, bb: Blackboard): void {
+    bb.set(this.resetFlagKey(node), true);
+  }
+
   registerAction(name: string, fn: ActionFn): void {
     this.actions.set(name, fn);
   }
@@ -80,47 +138,74 @@ export class BehaviorTreeRunner {
 
   private tickSequence(eid: number, node: BTNode, bb: Blackboard, dt: number): BTStatus {
     if (!node.children) return "success";
-    const key = this.runningChildKey + node.name;
+    this.consumeResetFlag(node, bb);
+    const key = this.runningKey(node);
+    const shadow = this.shadowKey(node);
     let startIdx = bb.get<number>(key) ?? 0;
+
+    // Detect an external change to `key` between ticks (e.g. something outside the tree
+    // forcing a resume point) that skips past the child we ourselves last recorded as
+    // running -- that child's own nested running-state is now stale and needs clearing.
+    const prevOwn = bb.get<number>(shadow);
+    if (prevOwn !== undefined && prevOwn !== startIdx && node.children[prevOwn]) {
+      this.markForReset(node.children[prevOwn], bb);
+    }
 
     for (let i = startIdx; i < node.children.length; i++) {
       const status = this.tick(eid, node.children[i], bb, dt);
       if (status === "running") {
         bb.set(key, i);
+        bb.set(shadow, i);
         return "running";
       }
       if (status === "failure") {
         bb.delete(key);
+        bb.delete(shadow);
         return "failure";
       }
     }
     bb.delete(key);
+    bb.delete(shadow);
     return "success";
   }
 
   private tickSelector(eid: number, node: BTNode, bb: Blackboard, dt: number): BTStatus {
     if (!node.children) return "failure";
-    const key = this.runningChildKey + node.name;
+    this.consumeResetFlag(node, bb);
+    const key = this.runningKey(node);
+    const shadow = this.shadowKey(node);
     let startIdx = bb.get<number>(key) ?? 0;
+
+    // Same interrupt detection as tickSequence: if something switched us to a different
+    // resume index than the one we last recorded ourselves, the branch we abandoned still
+    // has stale nested running-state that needs to be cleared (lazily, on its next tick).
+    const prevOwn = bb.get<number>(shadow);
+    if (prevOwn !== undefined && prevOwn !== startIdx && node.children[prevOwn]) {
+      this.markForReset(node.children[prevOwn], bb);
+    }
 
     for (let i = startIdx; i < node.children.length; i++) {
       const status = this.tick(eid, node.children[i], bb, dt);
       if (status === "running") {
         bb.set(key, i);
+        bb.set(shadow, i);
         return "running";
       }
       if (status === "success") {
         bb.delete(key);
+        bb.delete(shadow);
         return "success";
       }
     }
     bb.delete(key);
+    bb.delete(shadow);
     return "failure";
   }
 
   private tickParallel(eid: number, node: BTNode, bb: Blackboard, dt: number): BTStatus {
     if (!node.children) return "success";
-    const key = this.runningChildKey + node.name;
+    this.consumeResetFlag(node, bb);
+    const key = this.runningKey(node);
 
     // Per-child completed status, so a child that already returned success/failure isn't
     // re-ticked (re-running its side effects) every frame just because a sibling is still

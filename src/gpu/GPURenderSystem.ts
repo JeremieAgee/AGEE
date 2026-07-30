@@ -10,7 +10,23 @@ import { createFrameLayouts, type FrameLayouts } from "./BindGroupLayouts";
 import type { Handle } from "../core/handles/Handle";
 import type { HandleMap } from "../core/handles/Handle";
 import type { CameraSystem } from "../camera/CameraSystem";
+import { LightSync } from "./LightSync";
 import forwardOpaqueWGSL from "./shaders/forward_opaque.wgsl?raw";
+
+// AUDIT FIX (bug #4): writes an Euler rotation directly into an existing Quat
+// instead of allocating a new one, mirroring Quat.fromEuler's formula exactly.
+// Used in the per-visible-entity draw loop below, where every other temporary
+// (_pos, _quat, _scale, _modelMat, _normalMat) is pooled — calling the
+// allocating Quat.fromEuler() once per entity per frame was the one exception.
+function eulerToQuatInto(out: Quat, x: number, y: number, z: number): void {
+  const cx = Math.cos(x * 0.5), sx = Math.sin(x * 0.5);
+  const cy = Math.cos(y * 0.5), sy = Math.sin(y * 0.5);
+  const cz = Math.cos(z * 0.5), sz = Math.sin(z * 0.5);
+  out.x = sx * cy * cz - cx * sy * sz;
+  out.y = cx * sy * cz + sx * cy * sz;
+  out.z = cx * cy * sz - sx * sy * cz;
+  out.w = cx * cy * cz + sx * sy * sz;
+}
 
 const MAX_ENTITIES = 16384;
 const MODEL_UNIFORM_SIZE = 128;
@@ -28,7 +44,15 @@ interface DrawCall {
 }
 
 export class GPURenderSystem extends System {
-  priority = 900;
+  // AUDIT FIX (bug #6): this used to collide with RenderSystem's priority=900.
+  // Per src/core/Engine.ts's doc comment where both are registered, this
+  // WebGPU-native path is the primary opaque-geometry draw path and the Three.js
+  // RenderSystem composites a transparent overlay on top of it afterward.
+  // SystemScheduler sorts/executes systems by ascending priority (lower runs
+  // first — see SystemScheduler.buildStagesForPhase), so this must run before
+  // RenderSystem while still running after CullingSystem (priority 800), whose
+  // visibility decisions it depends on.
+  priority = 850;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "render";
 
   static reads = ["Transform", "GPUMeshRenderer"];
@@ -51,7 +75,7 @@ export class GPURenderSystem extends System {
   private perObjectBindGroup!: GPUBindGroup;
 
   private cameraData = new Float32Array(CAMERA_UNIFORM_SIZE / 4);
-  private modelData!: Float32Array;
+  private modelData!: Float32Array<ArrayBuffer>;
   private lightData = new Float32Array(MAX_LIGHTS * LIGHT_STRIDE / 4);
   private lightInfoData = new Uint32Array(4);
 
@@ -72,6 +96,7 @@ export class GPURenderSystem extends System {
   private _lightCount = 0;
   private _cameraSystem: CameraSystem | null = null;
   private drawList: DrawCall[] = [];
+  private _lightSync: LightSync | null = null;
 
   setGPUContext(ctx: GPUContext): void {
     this.gpuCtx = ctx;
@@ -175,12 +200,25 @@ export class GPURenderSystem extends System {
     });
   }
 
+  // AUDIT FIX (bug #5): previously always wrote into slot 0 and hard-coded
+  // _lightCount to 1 on every call, so a second light silently clobbered the
+  // first instead of the count reflecting how many lights actually exist (the
+  // storage buffer backing this supports up to MAX_LIGHTS=64). Now each call
+  // appends into the next free slot and increments the count.
   setDirectionalLight(dirX: number, dirY: number, dirZ: number, r: number, g: number, b: number, intensity: number): void {
-    this.lightData[0] = 0; this.lightData[1] = 0; this.lightData[2] = 0; this.lightData[3] = 0;
-    this.lightData[4] = dirX; this.lightData[5] = dirY; this.lightData[6] = dirZ; this.lightData[7] = 0;
-    this.lightData[8] = r * intensity; this.lightData[9] = g * intensity; this.lightData[10] = b * intensity; this.lightData[11] = intensity;
-    this.lightData[12] = 0; this.lightData[13] = 0; this.lightData[14] = 0; this.lightData[15] = 0;
-    this._lightCount = 1;
+    if (this._lightCount >= MAX_LIGHTS) return;
+    const base = this._lightCount * (LIGHT_STRIDE / 4);
+    this.lightData[base + 0] = 0; this.lightData[base + 1] = 0; this.lightData[base + 2] = 0; this.lightData[base + 3] = 0;
+    this.lightData[base + 4] = dirX; this.lightData[base + 5] = dirY; this.lightData[base + 6] = dirZ; this.lightData[base + 7] = 0;
+    this.lightData[base + 8] = r * intensity; this.lightData[base + 9] = g * intensity; this.lightData[base + 10] = b * intensity; this.lightData[base + 11] = intensity;
+    this.lightData[base + 12] = 0; this.lightData[base + 13] = 0; this.lightData[base + 14] = 0; this.lightData[base + 15] = 0;
+    this._lightCount++;
+  }
+
+  /** Clears the accumulated light count so a fresh per-frame sync (LightSync)
+   * can repopulate it without lights persisting across frames after removal. */
+  resetLights(): void {
+    this._lightCount = 0;
   }
 
   update(_dt: number): void {
@@ -194,7 +232,6 @@ export class GPURenderSystem extends System {
     }
 
     const entities = this.query.entities;
-    if (entities.length === 0) return;
 
     const { device } = this.gpuCtx;
 
@@ -205,6 +242,14 @@ export class GPURenderSystem extends System {
     this.cameraData[18] = this.cameraPosition.z;
     this.cameraData[19] = 1.0;
     device.queue.writeBuffer(this.cameraBuffer, 0, this.cameraData);
+
+    // AUDIT FIX (bug #5): pull ECS Light components into the native light buffer
+    // every frame. `this.world` is only populated once this system has been
+    // added to a World (see System base class), so guard for standalone use.
+    if (this.world) {
+      if (!this._lightSync) this._lightSync = new LightSync();
+      this._lightSync.sync(this.world, this);
+    }
 
     this.lightInfoData[0] = this._lightCount;
     device.queue.writeBuffer(this.lightInfoBuffer, 0, this.lightInfoData);
@@ -240,8 +285,7 @@ export class GPURenderSystem extends System {
       if (drawCount >= MAX_ENTITIES) break;
 
       this._pos.set(tx[eid], ty[eid], tz[eid]);
-      const q = Quat.fromEuler(trx[eid], trY[eid], trz[eid]);
-      this._quat.set(q.x, q.y, q.z, q.w);
+      eulerToQuatInto(this._quat, trx[eid], trY[eid], trz[eid]);
       this._scale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
 
       this._modelMat.compose(this._pos, this._quat, this._scale);
@@ -272,12 +316,15 @@ export class GPURenderSystem extends System {
       drawCount++;
     }
 
-    if (drawCount === 0) return;
-
-    // Sort by material to minimize bind group switches
-    this.drawList.sort((a, b) => a.materialKey - b.materialKey);
-
-    device.queue.writeBuffer(this.modelBuffer, 0, this.modelData, 0, drawCount * floatsPerSlot);
+    // AUDIT FIX (bug #2): previously returned here (and earlier, when
+    // entities.length===0) without calling beginFrame()/endFrame() at all, so a
+    // zero-draw frame left the prior frame's contents on screen uncleared.
+    // Always present/clear; only the draw-specific work below is conditional.
+    if (drawCount > 0) {
+      // Sort by material to minimize bind group switches
+      this.drawList.sort((a, b) => a.materialKey - b.materialKey);
+      device.queue.writeBuffer(this.modelBuffer, 0, this.modelData, 0, drawCount * floatsPerSlot);
+    }
 
     const { encoder, colorView } = this.gpuCtx.beginFrame();
 
@@ -297,27 +344,29 @@ export class GPURenderSystem extends System {
       },
     });
 
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.perFrameBindGroup);
+    if (drawCount > 0) {
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, this.perFrameBindGroup);
 
-    let currentMaterialKey = -1;
+      let currentMaterialKey = -1;
 
-    for (let i = 0; i < this.drawList.length; i++) {
-      const { mesh, modelOffset, materialBindGroup, materialKey } = this.drawList[i];
+      for (let i = 0; i < this.drawList.length; i++) {
+        const { mesh, modelOffset, materialBindGroup, materialKey } = this.drawList[i];
 
-      if (materialKey !== currentMaterialKey) {
-        pass.setBindGroup(1, materialBindGroup);
-        currentMaterialKey = materialKey;
-      }
+        if (materialKey !== currentMaterialKey) {
+          pass.setBindGroup(1, materialBindGroup);
+          currentMaterialKey = materialKey;
+        }
 
-      pass.setBindGroup(2, this.perObjectBindGroup, [modelOffset]);
-      pass.setVertexBuffer(0, mesh.vertexBuffer);
+        pass.setBindGroup(2, this.perObjectBindGroup, [modelOffset]);
+        pass.setVertexBuffer(0, mesh.vertexBuffer);
 
-      if (mesh.indexBuffer) {
-        pass.setIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
-        pass.drawIndexed(mesh.indexCount);
-      } else {
-        pass.draw(mesh.vertexCount);
+        if (mesh.indexBuffer) {
+          pass.setIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
+          pass.drawIndexed(mesh.indexCount);
+        } else {
+          pass.draw(mesh.vertexCount);
+        }
       }
     }
 

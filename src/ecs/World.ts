@@ -6,6 +6,7 @@ import { System, SystemPhase } from "./System";
 import { ArchetypeIndex } from "./ArchetypeIndex";
 import { SystemScheduler, ExecutionPlan, SystemConstraint } from "./SystemScheduler";
 import type { EngineProfiler } from "../core/EngineProfiler";
+import { Parent } from "../core/HierarchyComponents";
 
 type EntityCallback = (eid: number) => void;
 
@@ -43,6 +44,13 @@ export class World {
   constructor(initialCapacity = 1024) {
     this.generations = new Uint32Array(initialCapacity);
     this.flags = new Uint32Array(initialCapacity);
+
+    // Parent.entity is a raw, recycled entity id with no built-in staleness check. Without
+    // this, destroying a parent leaves any child's Parent component silently pointing at a
+    // since-recycled id once that id is handed back out to a brand-new entity. Clear/remove
+    // the Parent component of anything pointing at an entity as it's destroyed, mirroring how
+    // Engine.ts hooks onEntityDestroy for MeshRenderer/Light cleanup.
+    this.onEntityDestroy((eid) => this.cleanupDanglingParentRefs(eid));
   }
 
   createEntity(): number {
@@ -295,5 +303,27 @@ export class World {
     const nextMask = this.archetypes.getMask(eid) & ~this.getComponentBit(name);
     this.archetypes.setMask(eid, nextMask);
     this.flags[eid] |= EntityFlags.ComponentRemoved | EntityFlags.ArchetypeChanged;
+  }
+
+  // Scans the Parent store (if it has ever been used) for any entity whose Parent.entity
+  // still points at the entity that's being destroyed, and removes their Parent component so
+  // it can't silently alias whatever new entity eventually gets that recycled id. Only looks
+  // at the store if one was actually created, so worlds that never touch hierarchy components
+  // pay no cost.
+  private cleanupDanglingParentRefs(destroyedEid: number): void {
+    const store = this.stores.get(Parent.name);
+    if (!store) return;
+
+    const entityColumn = store.getColumn("entity");
+    const staleChildren: number[] = [];
+    for (const childEid of store.entities) {
+      if (entityColumn[childEid] === destroyedEid) {
+        staleChildren.push(childEid);
+      }
+    }
+
+    for (const childEid of staleChildren) {
+      this.removeComponent(childEid, Parent);
+    }
   }
 }

@@ -65,6 +65,28 @@ function readFieldValue(r: BinaryReader, type: string): number {
   }
 }
 
+// Fields quantized to a fixed-point 16-bit representation on the wire when sent as part of a
+// full Snapshot (positions/rotations dominate snapshot bandwidth and don't need full f32
+// precision). Delta snapshots keep raw values since they already only carry changed fields.
+const QUANTIZED_FIELD_NAMES = new Set(["x", "y", "z", "rx", "ry", "rz"]);
+const QUANTIZE_SCALE = 100; // fixed-point precision: 1/100 of a unit per step
+
+function quantize(value: number): number {
+  const q = Math.round(value * QUANTIZE_SCALE);
+  return Math.max(-32768, Math.min(32767, q));
+}
+
+function writeQuantizedField(w: BinaryWriter, value: number): void {
+  const q = quantize(value);
+  w.writeU16(q < 0 ? q + 0x10000 : q);
+}
+
+function readQuantizedField(r: BinaryReader): number {
+  let v = r.readU16();
+  if (v & 0x8000) v -= 0x10000;
+  return v / QUANTIZE_SCALE;
+}
+
 export function writeMessageHeader(w: BinaryWriter, type: MessageType): void {
   w.writeU8(NETWORK_CONSTANTS.PROTOCOL_VERSION);
   w.writeU8(type);
@@ -161,13 +183,19 @@ export function writeSnapshot(
       const compIdx = registry.getIndex(compName);
       if (compIdx < 0) continue;
       const def = registry.getDef(compIdx)!;
+      const fieldOrder = registry.getSerializableFields(def);
       w.writeU8(compIdx);
       w.writeU8(fields.size);
       for (const [fieldName, value] of fields) {
         const type = def.schema[fieldName];
         if (!type || type === "ref") continue;
-        w.writeString(fieldName);
-        writeFieldValue(w, type, value);
+        const fieldIdx = fieldOrder.indexOf(fieldName);
+        w.writeU8(fieldIdx);
+        if (QUANTIZED_FIELD_NAMES.has(fieldName)) {
+          writeQuantizedField(w, value);
+        } else {
+          writeFieldValue(w, type, value);
+        }
       }
     }
   }
@@ -187,12 +215,20 @@ export function readSnapshot(r: BinaryReader, registry: ComponentRegistry): Snap
       const compIdx = r.readU8();
       const fieldCount = r.readU8();
       const def = registry.getDef(compIdx);
+      const fieldOrder = def ? registry.getSerializableFields(def) : [];
       const fields = new Map<string, number>();
 
       for (let f = 0; f < fieldCount; f++) {
-        const fieldName = r.readString();
-        const type = def ? def.schema[fieldName] : "f32";
-        fields.set(fieldName, readFieldValue(r, type || "f32"));
+        const fieldIdx = r.readU8();
+        const fieldName = fieldOrder[fieldIdx];
+        if (fieldName && QUANTIZED_FIELD_NAMES.has(fieldName)) {
+          const value = readQuantizedField(r);
+          fields.set(fieldName, value);
+        } else {
+          const type = fieldName && def ? def.schema[fieldName] : "f32";
+          const value = readFieldValue(r, type || "f32");
+          if (fieldName) fields.set(fieldName, value);
+        }
       }
 
       if (def) {
@@ -235,12 +271,14 @@ export function writeDeltaSnapshot(
       const compIdx = registry.getIndex(compName);
       if (compIdx < 0) continue;
       const def = registry.getDef(compIdx)!;
+      const fieldOrder = registry.getSerializableFields(def);
       w.writeU8(compIdx);
       w.writeU8(fields.size);
       for (const [fieldName, value] of fields) {
         const type = def.schema[fieldName];
         if (!type || type === "ref") continue;
-        w.writeString(fieldName);
+        const fieldIdx = fieldOrder.indexOf(fieldName);
+        w.writeU8(fieldIdx);
         writeFieldValue(w, type, value);
       }
     }
@@ -266,12 +304,15 @@ export function readDeltaSnapshot(r: BinaryReader, registry: ComponentRegistry):
         const compIdx = r.readU8();
         const fieldCount = r.readU8();
         const def = registry.getDef(compIdx);
+        const fieldOrder = def ? registry.getSerializableFields(def) : [];
         const fields = new Map<string, number>();
 
         for (let f = 0; f < fieldCount; f++) {
-          const fieldName = r.readString();
-          const type = def ? def.schema[fieldName] : "f32";
-          fields.set(fieldName, readFieldValue(r, type || "f32"));
+          const fieldIdx = r.readU8();
+          const fieldName = fieldOrder[fieldIdx];
+          const type = fieldName && def ? def.schema[fieldName] : "f32";
+          const value = readFieldValue(r, type || "f32");
+          if (fieldName) fields.set(fieldName, value);
         }
 
         if (def) {

@@ -207,11 +207,18 @@ export class NetworkReceiveSystem extends System {
 
         case MessageType.DeltaSnapshot: {
           const delta = readDeltaSnapshot(reader, this.registry);
-          this._lastReceivedTick = delta.tick;
           const baseline = this.snapshotManager.getSnapshot(delta.baseTick);
-          const full = baseline
-            ? this.snapshotManager.applyDelta(baseline, delta)
-            : { tick: delta.tick, entries: [] };
+          if (!baseline) {
+            // We don't have the baseline this delta was computed against (e.g. it aged out
+            // of the ring buffer). Synthesizing an empty snapshot here would make every
+            // currently-known entity look despawned once fed into applySnapshotToWorld, so
+            // instead drop this delta entirely and wait for a fresh full Snapshot (or a
+            // later delta based on a baseline we do have) rather than mass-destroying state.
+            console.warn(`[Network] Missing baseline snapshot for tick ${delta.baseTick}; dropping delta for tick ${delta.tick}`);
+            break;
+          }
+          this._lastReceivedTick = delta.tick;
+          const full = this.snapshotManager.applyDelta(baseline, delta);
           this.snapshotManager.storeSnapshot(full);
           this.processServerSnapshot(full);
           break;
@@ -368,12 +375,23 @@ export class NetworkReceiveSystem extends System {
     const trY = this.transformStore.getColumn("ry") as Float32Array;
     const trz = this.transformStore.getColumn("rz") as Float32Array;
     const tCol = this.interpStore.getColumn("t") as Float32Array;
+    const renderDelayCol = this.interpStore.getColumn("renderDelay") as Float32Array;
 
     for (const eid of this.interpQuery.entities) {
       this.ensureInterpCapacity(eid);
       this.interpTimer[eid] += dt;
 
-      const t = Math.min(this.interpTimer[eid] / this.serverTickInterval, 1);
+      // renderDelay is expressed relative to DEFAULT_RENDER_DELAY_MS, the delay a plain
+      // single-tick lerp (over serverTickInterval) implicitly assumes. An entity spawned with
+      // the default delay therefore interpolates exactly as before (window ===
+      // serverTickInterval); a larger renderDelay stretches the window so the entity visibly
+      // lags further behind the latest snapshot, and a renderDelay of 0 snaps immediately to
+      // the latest target instead of easing toward it.
+      const renderDelayMs = renderDelayCol[eid];
+      const window = renderDelayMs > 0
+        ? this.serverTickInterval * (renderDelayMs / NETWORK_CONSTANTS.DEFAULT_RENDER_DELAY_MS)
+        : 0;
+      const t = window > 0 ? Math.min(this.interpTimer[eid] / window, 1) : 1;
       tCol[eid] = t;
 
       tx[eid] = this.prevX[eid] + (this.currX[eid] - this.prevX[eid]) * t;
@@ -450,7 +468,7 @@ export class NetworkReceiveSystem extends System {
     let newCap = this.interpCapacity;
     while (newCap <= eid) newCap *= INTERP_GROWTH_FACTOR;
 
-    const grow = (old: Float32Array): Float32Array => {
+    const grow = (old: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> => {
       const fresh = new Float32Array(newCap);
       fresh.set(old);
       return fresh;

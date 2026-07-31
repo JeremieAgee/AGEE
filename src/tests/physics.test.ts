@@ -409,13 +409,14 @@ describe("PhysicsSystem — character controller", () => {
     // moveCharacter() with a physics step, so do the same here.
     world.update(1 / 60);
 
-    // Let the controller settle onto the floor first.
+    // Let the controller settle onto the floor first. moveCharacter takes a velocity
+    // (units/second), not a per-frame displacement, so -6 u/s * (1/60)s = -0.1 units/call.
     for (let i = 0; i < 30; i++) {
-      physics.moveCharacter(player, 0, -0.1, 0, 1 / 60);
+      physics.moveCharacter(player, 0, -6, 0, 1 / 60);
       world.update(1 / 60);
     }
 
-    const result = physics.moveCharacter(player, 0.1, 0, 0, 1 / 60);
+    const result = physics.moveCharacter(player, 6, 0, 0, 1 / 60);
     world.update(1 / 60);
     expect(result.grounded).toBe(true);
 
@@ -564,6 +565,44 @@ describe("PhysicsSystem — AUDIT findings", () => {
         // ...and the first one added should still be the one getCollider() resolves to,
         // since it was never removed and getCollider() has no way to express "both".
         expect(physics.getCollider(eid)).toBe(first);
+      } finally {
+        physics.destroy();
+      }
+    }
+  );
+
+  it(
+    // AUDIT: moveCharacter(eid, vx, vy, vz, dt) accepted dt but never used it — the vector
+    // was handed straight to Rapier's shape-cast as an absolute per-call displacement, so the
+    // same (vx, vy, vz) moved a character by the same distance regardless of frame time
+    // instead of scaling by dt like a velocity should. See PhysicsSystem.ts moveCharacter().
+    "moveCharacter scales movement by dt instead of ignoring it",
+    async () => {
+      const { world, physics } = await makePhysicsWorld();
+      try {
+        const { eid: floor } = addFallingBody(world, physics, "fixed", -5);
+        physics.addCollider(floor, "box", { halfX: 50, halfY: 0.5, halfZ: 50 });
+
+        const { eid: player } = addFallingBody(world, physics, "kinematic", 0);
+        physics.addCollider(player, "capsule", { radius: 0.3, halfHeight: 0.5 });
+        physics.createCharacterController(player, {
+          height: 1.8, radius: 0.3, stepHeight: 0.3, maxSlope: Math.PI / 4, skinWidth: 0.01,
+        });
+        world.update(1 / 60);
+
+        const startX = physics.getBody(player)!.translation().x;
+        physics.moveCharacter(player, 6, 0, 0, 1 / 60);
+        world.update(1 / 60);
+        const movedAtFullDt = physics.getBody(player)!.translation().x - startX;
+
+        const midX = physics.getBody(player)!.translation().x;
+        physics.moveCharacter(player, 6, 0, 0, 1 / 120);
+        world.update(1 / 60);
+        const movedAtHalfDt = physics.getBody(player)!.translation().x - midX;
+
+        // Same velocity, half the dt, should move roughly half as far.
+        expect(movedAtFullDt).toBeGreaterThan(0);
+        expect(approx(movedAtHalfDt, movedAtFullDt / 2, 1e-3)).toBe(true);
       } finally {
         physics.destroy();
       }

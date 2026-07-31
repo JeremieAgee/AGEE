@@ -2,6 +2,7 @@
   "name": "agee-engine",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Adaptive Game Engine Environment (AGEE) — a modular TypeScript browser game engine.",
   "main": "src/index.ts",

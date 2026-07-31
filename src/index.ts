@@ -98,7 +98,7 @@ export { ParticleSystemEngine } from "./particles/ParticleSystem";
 // UI
 export { UISystem } from "./ui/UISystem";
 export { UIManager, WorldUI } from "./ui/UIManager";
-export { Widget, Panel, Label, Button, ProgressBar, Image } from "./ui/Widget";
+export { Widget, Panel, Label, Button, ProgressBar, Image, escapeHtml } from "./ui/Widget";
 export type { UIStyle } from "./ui/Widget";
 
 // Scene
@@ -149,13 +149,6 @@ export { HumanoidBone, createHumanoid, animateHumanoidWalk, startHumanoidRagdoll
 export { HUMANOID_BONES, HUMANOID_JOINTS } from "./skeleton/HumanoidFactory";
 export type { BonePivot, HumanoidMaterials, HumanoidData } from "./skeleton/HumanoidFactory";
 
-// Chunked Archetype ECS (AAA storage)
-export { Chunk, CHUNK_SIZE } from "./ecs/Chunk";
-export { ChunkedArchetype, ChunkedArchetypeStorage } from "./ecs/ChunkedArchetype";
-export type { EntityLocation } from "./ecs/ChunkedArchetype";
-export { ChunkedQuery } from "./ecs/ChunkedQuery";
-export type { ChunkIterationContext } from "./ecs/ChunkedQuery";
-
 // Event Journal (typed, deferred, replayable)
 export { EventJournal, defineEvent } from "./core/EventJournal";
 
@@ -172,17 +165,13 @@ export { MaterialSystem, MaterialComponent, createDefaultMaterial } from "./rend
 export type { MaterialDef, MaterialParams, MaterialHandle as MaterialDefHandle } from "./rendering/MaterialDef";
 export { BlendMode, RenderQueue } from "./rendering/MaterialDef";
 
-// Render Graph
-export { RenderGraph, MainScenePass, ShadowPass, DebugWireframePass } from "./rendering/RenderGraph";
-export type { RenderPass, RenderContext } from "./rendering/RenderGraph";
-export { PassType } from "./rendering/RenderGraph";
-
 // Collision layers
 export { CollisionLayer } from "./systems/PhysicsSystem";
 export type { CollisionFilter } from "./systems/PhysicsSystem";
 
 // Navigation helpers
 export { BinaryHeap } from "./navigation/BinaryHeap";
+export { MinHeap } from "./core/BinaryHeap";
 
 // Pooling
 export { ObjectPool } from "./pooling/ObjectPool";

@@ -8,6 +8,7 @@ import { BinaryWriter, BinaryReader } from "../core/serialization/BinaryBuffer";
 import { Replicated, NetworkOwner, NetworkInterpolated } from "../network/NetworkComponents";
 import {
   ComponentRegistry,
+  ActionRegistry,
   writeMessageHeader,
   readMessageHeader,
   writeConnectAck,
@@ -115,19 +116,36 @@ describe("NetworkProtocol — round trips", () => {
   });
 
   it("Input message round trip preserves tick, clientId and action map", () => {
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register("moveX", "jump");
     const actions = new Map<string, number>([["moveX", 0.75], ["jump", 1]]);
     const input: InputPayload = { tick: 42, clientId: 3, actions };
 
     const w = new BinaryWriter(64);
-    writeInput(w, input);
+    writeInput(w, input, actionRegistry);
     const r = new BinaryReader(w.toArrayBuffer());
     readMessageHeader(r);
-    const decoded = readInput(r);
+    const decoded = readInput(r, actionRegistry);
 
     expect(decoded.tick).toBe(42);
     expect(decoded.clientId).toBe(3);
     expect(decoded.actions.get("moveX")).toBeCloseTo(0.75);
     expect(decoded.actions.get("jump")).toBe(1);
+  });
+
+  it("writeInput drops (and warns about) an action name that was never registered", () => {
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register("moveX");
+    const input: InputPayload = { tick: 1, clientId: 1, actions: new Map([["moveX", 1], ["unregisteredAction", 5]]) };
+
+    const w = new BinaryWriter(64);
+    writeInput(w, input, actionRegistry);
+    const r = new BinaryReader(w.toArrayBuffer());
+    readMessageHeader(r);
+    const decoded = readInput(r, actionRegistry);
+
+    expect(decoded.actions.has("moveX")).toBe(true);
+    expect(decoded.actions.has("unregisteredAction")).toBe(false);
   });
 
   it("InputAck round trip", () => {
@@ -215,12 +233,11 @@ describe("NetworkProtocol — round trips", () => {
     const w = new BinaryWriter(64);
     writeDeltaSnapshot(w, delta, registry);
 
-    // Correct/expected wire cost for one changed f32 field:
+    // Correct/expected wire cost for one changed, quantized ("x") field:
     // header(2) + baseTick(4) + tick(4) + entryCount(2) + networkId(4) + flags(1) +
-    // compCount(1) + compIdx(1) + fieldCount(1) + fieldIndex(1, fixed index) + value(4) = 25.
-    // Actual encoding instead spends 4-byte length prefix + 1 char ("x") = 5 bytes on the
-    // field *name* where a fixed 1-byte index would do, inflating this to 29 bytes.
-    expect(w.size).toBe(25);
+    // compCount(1) + compIdx(1) + fieldCount(1) + fieldIndex(1, fixed index) +
+    // quantized value(2, u16) = 23.
+    expect(w.size).toBe(23);
   });
 
   // AUDIT: positions/rotations are sent as raw 32-bit floats with no quantization at all —
@@ -251,6 +268,66 @@ describe("NetworkProtocol — round trips", () => {
     // bytes, for 3 fields = 9 bytes total => ideal message size of 24 bytes.
     const idealFieldBytes = 3 * (1 + 2);
     expect(w.size).toBe(fixedOverhead + idealFieldBytes);
+  });
+
+  // Regression test: delta snapshots previously wrote QUANTIZED_FIELD_NAMES at full f32
+  // precision (only writeSnapshot applied quantization) even though deltas carry the large
+  // majority of steady-state traffic — see NetworkProtocol.ts writeDeltaSnapshot/readDeltaSnapshot.
+  it("delta snapshot position fields are quantized like full snapshots, and round-trip within quantization precision", () => {
+    const registry = new ComponentRegistry();
+    registry.register(Transform, Replicated);
+
+    const delta: DeltaSnapshot = {
+      baseTick: 0,
+      tick: 1,
+      entries: [
+        { networkId: 1, spawned: false, despawned: false, components: new Map([["Transform", new Map([["x", 12.34], ["y", -5], ["z", 100.5]])]]) },
+      ],
+    };
+
+    const w = new BinaryWriter(64);
+    writeDeltaSnapshot(w, delta, registry);
+    // header(2)+baseTick(4)+tick(4)+entryCount(2)+networkId(4)+flags(1)+compCount(1)+compIdx(1)+
+    // fieldCount(1) + 3 fields * (fieldIndex(1) + quantized value(2)) = 20 + 9 = 29.
+    expect(w.size).toBe(29);
+
+    const r = new BinaryReader(w.toArrayBuffer());
+    readMessageHeader(r);
+    const decoded = readDeltaSnapshot(r, registry);
+    const fields = decoded.entries[0].components.get("Transform")!;
+    expect(fields.get("x")).toBeCloseTo(12.34, 2);
+    expect(fields.get("y")).toBeCloseTo(-5, 2);
+    expect(fields.get("z")).toBeCloseTo(100.5, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BinaryWriter.reset() — enables writer reuse instead of a fresh allocation per message
+// ---------------------------------------------------------------------------
+
+describe("BinaryWriter.reset()", () => {
+  it("rewinds the write cursor so a writer can be reused for a second, unrelated message", () => {
+    const w = new BinaryWriter(64);
+    w.writeU32(0xdeadbeef);
+    w.writeU8(7);
+    expect(w.size).toBe(5);
+
+    w.reset();
+    expect(w.size).toBe(0);
+
+    w.writeU16(42);
+    expect(w.size).toBe(2);
+    const r = new BinaryReader(w.toArrayBuffer());
+    expect(r.readU16()).toBe(42);
+  });
+
+  it("retains its grown capacity across reset(), so a later large write doesn't re-shrink it", () => {
+    const w = new BinaryWriter(4);
+    for (let i = 0; i < 100; i++) w.writeF32(i); // forces several grow()s
+    w.reset();
+    w.writeF32(1.5);
+    const r = new BinaryReader(w.toArrayBuffer());
+    expect(r.readF32()).toBeCloseTo(1.5);
   });
 });
 
@@ -630,6 +707,53 @@ describe("WebSocketTransport (construction/state, no real socket)", () => {
     t.receivePong();
     expect(t.rtt).toBeGreaterThanOrEqual(0);
   });
+
+  it("drops an oversized inbound message and closes the connection instead of queuing it", () => {
+    let closeCalled = false;
+    let lastSocket: any;
+    (globalThis as any).WebSocket = class {
+      binaryType = "";
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: { reason?: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(public url: string) { lastSocket = this; }
+      send(_data: unknown): void {}
+      close(): void { closeCalled = true; }
+    };
+
+    const t = new WebSocketTransport();
+    t.connect("ws://example.test");
+    const oversized = new ArrayBuffer(NETWORK_CONSTANTS.MAX_MESSAGE_BYTES + 1);
+    lastSocket.onmessage({ data: oversized });
+
+    expect(closeCalled).toBe(true);
+    expect(t.poll()).not.toContainEqual(expect.objectContaining({ type: "message", data: oversized }));
+  });
+
+  it("accepts an inbound message at or under the size limit", () => {
+    let closeCalled = false;
+    let lastSocket: any;
+    (globalThis as any).WebSocket = class {
+      binaryType = "";
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: { reason?: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(public url: string) { lastSocket = this; }
+      send(_data: unknown): void {}
+      close(): void { closeCalled = true; }
+    };
+
+    const t = new WebSocketTransport();
+    t.connect("ws://example.test");
+    const normal = new ArrayBuffer(64);
+    lastSocket.onmessage({ data: normal });
+
+    expect(closeCalled).toBe(false);
+    const events = t.poll();
+    expect(events).toContainEqual({ type: "message", data: normal });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -701,8 +825,11 @@ describe("NetworkReceiveSystem — server input path", () => {
     const snapshotManager = new SnapshotManager(world, registry);
     const inputBuffer = new InputBuffer();
 
+    const actionRegistry = new ActionRegistry();
+    actionRegistry.register("move");
+
     const receiveSystem = new NetworkReceiveSystem();
-    receiveSystem.configure(undefined as unknown as Transport, snapshotManager, registry, inputBuffer, "server");
+    receiveSystem.configure(undefined as unknown as Transport, snapshotManager, registry, inputBuffer, "server", actionRegistry);
     world.addSystem(receiveSystem);
 
     const { client, server } = LoopbackTransport.createPair();
@@ -710,7 +837,7 @@ describe("NetworkReceiveSystem — server input path", () => {
     receiveSystem.addClientTransport(7, server);
 
     const writer = new BinaryWriter(64);
-    writeInput(writer, { tick: 3, clientId: 999 /* client lies about its own id */, actions: new Map([["move", 1]]) });
+    writeInput(writer, { tick: 3, clientId: 999 /* client lies about its own id */, actions: new Map([["move", 1]]) }, actionRegistry);
     client.send(writer.toArrayBuffer());
 
     receiveSystem.update(1 / 20);
@@ -741,12 +868,13 @@ describe("NetworkSendSystem + NetworkReceiveSystem integration", () => {
     const snapshotManager = new SnapshotManager(world, registry);
     snapshotManager.registerReplicatedComponents(Transform, Velocity);
     const inputBuffer = new InputBuffer();
+    const actionRegistry = new ActionRegistry();
 
     const receiveSystem = new NetworkReceiveSystem();
-    receiveSystem.configure(transport, snapshotManager, registry, inputBuffer, role);
+    receiveSystem.configure(transport, snapshotManager, registry, inputBuffer, role, actionRegistry);
 
     const sendSystem = new NetworkSendSystem();
-    sendSystem.configure(transport, snapshotManager, registry, inputBuffer, role);
+    sendSystem.configure(transport, snapshotManager, registry, inputBuffer, role, actionRegistry);
     sendSystem.tickRate = 20;
     sendSystem.setNetworkIdMap(receiveSystem.networkIdMap);
 
@@ -786,6 +914,29 @@ describe("NetworkSendSystem + NetworkReceiveSystem integration", () => {
     expect(client.world.getStore(Transform).get(clientEid!, "x")).toBeCloseTo(55);
   });
 
+  // Regression test: sendServerSnapshots()/sendClientInput()/sendInputAck() previously did
+  // `this.writer = new BinaryWriter(N)` on every call — a fresh writer (and backing
+  // ArrayBuffer) per client per tick — instead of reusing one growable writer. See
+  // NetworkSendSystem.ts.
+  it("reuses the same BinaryWriter instance across multiple send ticks instead of reallocating", () => {
+    const { client: clientTransport, server: serverTransport } = LoopbackTransport.createPair();
+    clientTransport.connect("test");
+
+    const server = makeSide("server", serverTransport);
+    server.sendSystem.addClient(1, serverTransport);
+
+    const writerBeforeAnyTick = (server.sendSystem as any).writer;
+
+    const tickDt = 1 / 20;
+    server.sendSystem.update(tickDt);
+    const writerAfterTick1 = (server.sendSystem as any).writer;
+    server.sendSystem.update(tickDt);
+    const writerAfterTick2 = (server.sendSystem as any).writer;
+
+    expect(writerAfterTick1).toBe(writerBeforeAnyTick);
+    expect(writerAfterTick2).toBe(writerBeforeAnyTick);
+  });
+
   // AUDIT: NetworkSendSystem's periodic client ping bypasses WebSocketTransport.sendPing() —
   // it writes a raw Ping message via transport.send() instead (NetworkSendSystem.ts:128-130),
   // so the ping timestamp used for RTT is never recorded. When the Pong echo comes back,
@@ -806,11 +957,11 @@ describe("NetworkSendSystem + NetworkReceiveSystem integration", () => {
     const inputBuffer = new InputBuffer();
 
     const clientSend = new NetworkSendSystem();
-    clientSend.configure(clientT, snapshotManager, registry, inputBuffer, "client");
+    clientSend.configure(clientT, snapshotManager, registry, inputBuffer, "client", new ActionRegistry());
     clientWorld.addSystem(clientSend);
 
     const clientReceive = new NetworkReceiveSystem();
-    clientReceive.configure(clientT, snapshotManager, registry, inputBuffer, "client");
+    clientReceive.configure(clientT, snapshotManager, registry, inputBuffer, "client", new ActionRegistry());
     clientWorld.addSystem(clientReceive);
 
     const serverWorld = new World();
@@ -819,7 +970,7 @@ describe("NetworkSendSystem + NetworkReceiveSystem integration", () => {
     const serverSnapshotManager = new SnapshotManager(serverWorld, serverRegistry);
     const serverInputBuffer = new InputBuffer();
     const serverReceive = new NetworkReceiveSystem();
-    serverReceive.configure(serverT, serverSnapshotManager, serverRegistry, serverInputBuffer, "server");
+    serverReceive.configure(serverT, serverSnapshotManager, serverRegistry, serverInputBuffer, "server", new ActionRegistry());
     serverWorld.addSystem(serverReceive);
 
     // Drive a full second so the client's 1s ping accumulator fires exactly once.
@@ -848,7 +999,7 @@ describe("NetworkSendSystem + NetworkReceiveSystem integration", () => {
     const inputBuffer = new InputBuffer();
 
     const receiveSystem = new NetworkReceiveSystem();
-    receiveSystem.configure(clientTransport, snapshotManager, registry, inputBuffer, "client");
+    receiveSystem.configure(clientTransport, snapshotManager, registry, inputBuffer, "client", new ActionRegistry());
     world.addSystem(receiveSystem);
 
     function sendFullSnapshot(snapshot: Snapshot): void {

@@ -40,10 +40,20 @@ export class World {
   private flags: Uint32Array;
   private _alive = new BitSet();
   private destroyCallbacks: EntityCallback[] = [];
+  private readonly initialCapacity: number;
+
+  // Reverse index (parent eid -> child eids) kept in sync via the Parent store's onAdd/onRemove
+  // hooks, so destroyEntity's dangling-Parent cleanup doesn't have to linear-scan every entity
+  // with a Parent component on every single destroy (that scan was O(N) per destroy, O(N^2) for
+  // a mass hierarchy teardown like a level unload).
+  private childrenByParent = new Map<number, Set<number>>();
 
   constructor(initialCapacity = 1024) {
+    this.initialCapacity = initialCapacity;
     this.generations = new Uint32Array(initialCapacity);
     this.flags = new Uint32Array(initialCapacity);
+
+    this.attachParentIndexHooks();
 
     // Parent.entity is a raw, recycled entity id with no built-in staleness check. Without
     // this, destroying a parent leaves any child's Parent component silently pointing at a
@@ -51,6 +61,29 @@ export class World {
     // the Parent component of anything pointing at an entity as it's destroyed, mirroring how
     // Engine.ts hooks onEntityDestroy for MeshRenderer/Light cleanup.
     this.onEntityDestroy((eid) => this.cleanupDanglingParentRefs(eid));
+  }
+
+  // Wires childrenByParent up to whatever ComponentStore currently backs Parent. Must be
+  // re-run after clear() recreates the store map, or the new Parent store would silently
+  // stop feeding the reverse index.
+  private attachParentIndexHooks(): void {
+    const parentStore = this.getStore(Parent);
+    parentStore.onAdd((eid) => {
+      const parentEid = parentStore.get(eid, "entity") as number;
+      let children = this.childrenByParent.get(parentEid);
+      if (!children) {
+        children = new Set();
+        this.childrenByParent.set(parentEid, children);
+      }
+      children.add(eid);
+    });
+    parentStore.onRemove((eid) => {
+      const parentEid = parentStore.get(eid, "entity") as number;
+      const children = this.childrenByParent.get(parentEid);
+      if (!children) return;
+      children.delete(eid);
+      if (children.size === 0) this.childrenByParent.delete(parentEid);
+    });
   }
 
   createEntity(): number {
@@ -189,6 +222,11 @@ export class World {
   }
 
   removeComponent(eid: number, def: ComponentDef): void {
+    // Without this, a stale eid held past destroyEntity() + recycle can silently mutate
+    // whichever new entity has since been handed that same recycled id — mirrors the
+    // isAlive() guard addComponent() already applies.
+    if (!this._alive.has(eid)) return;
+
     const store = this.getStore(def);
     if (!store.has(eid)) return;
 
@@ -197,6 +235,7 @@ export class World {
   }
 
   hasComponent(eid: number, def: ComponentDef): boolean {
+    if (!this._alive.has(eid)) return false;
     return this.getStore(def).has(eid);
   }
 
@@ -263,11 +302,15 @@ export class World {
     this.nextEntityId = 0;
     this.recycled.length = 0;
     this._alive.clear();
-    this.generations = new Uint32Array(1024);
-    this.flags = new Uint32Array(1024);
+    this.generations = new Uint32Array(this.initialCapacity);
+    this.flags = new Uint32Array(this.initialCapacity);
     this.destroyCallbacks.length = 0;
+    this.childrenByParent.clear();
     this.systemsDirty = true;
     this.cachedPlan = null;
+
+    this.attachParentIndexHooks();
+    this.onEntityDestroy((eid) => this.cleanupDanglingParentRefs(eid));
   }
 
   private growEntityArrays(requiredCapacity: number): void {
@@ -305,24 +348,17 @@ export class World {
     this.flags[eid] |= EntityFlags.ComponentRemoved | EntityFlags.ArchetypeChanged;
   }
 
-  // Scans the Parent store (if it has ever been used) for any entity whose Parent.entity
-  // still points at the entity that's being destroyed, and removes their Parent component so
-  // it can't silently alias whatever new entity eventually gets that recycled id. Only looks
-  // at the store if one was actually created, so worlds that never touch hierarchy components
-  // pay no cost.
+  // Removes the Parent component from any entity whose Parent.entity still points at the
+  // entity that's being destroyed, so it can't silently alias whatever new entity eventually
+  // gets that recycled id. Looks the affected children up in childrenByParent (kept current by
+  // attachParentIndexHooks) instead of scanning every entity with a Parent component.
   private cleanupDanglingParentRefs(destroyedEid: number): void {
-    const store = this.stores.get(Parent.name);
-    if (!store) return;
+    const children = this.childrenByParent.get(destroyedEid);
+    if (!children || children.size === 0) return;
 
-    const entityColumn = store.getColumn("entity");
-    const staleChildren: number[] = [];
-    for (const childEid of store.entities) {
-      if (entityColumn[childEid] === destroyedEid) {
-        staleChildren.push(childEid);
-      }
-    }
-
-    for (const childEid of staleChildren) {
+    // Snapshot first: removeComponent(childEid, Parent) below mutates this same Set via the
+    // onRemove hook, and iterating a Set while deleting from it is unsafe.
+    for (const childEid of Array.from(children)) {
       this.removeComponent(childEid, Parent);
     }
   }

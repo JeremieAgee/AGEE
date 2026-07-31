@@ -403,6 +403,38 @@ describe("SkeletonSystem — AUDIT findings", () => {
       expect(pose!.pz).toBeCloseTo(3);
     }
   );
+
+  it("forward kinematics skips recomputing bones with no pending local/ancestor change", () => {
+    const world = new World();
+    const skeleton = new SkeletonSystem();
+    world.addSystem(skeleton);
+
+    const defHandle = skeleton.createDefinition([
+      { name: "root", parentIndex: -1, length: 1 },
+      { name: "child", parentIndex: 0, length: 1 },
+    ]);
+    const instHandle = skeleton.createInstance(defHandle);
+
+    skeleton.setBoneLocalPose(instHandle, 1, 5, 0, 0, 0, 0, 0, 1);
+    skeleton.update(1 / 60);
+    expect(skeleton.getBoneWorldPose(instHandle, 1)!.px).toBeCloseTo(5);
+
+    // Mutate the child's local pose directly, bypassing setBoneLocalPose (so its LOCAL dirty
+    // flag is never set) and without touching the root, so nothing upstream is dirty either.
+    // If evaluateBoneFK recomputed unconditionally (no dirty check), this new value would show
+    // up in the next getBoneWorldPose(); the dirty check should make the stale cached world
+    // pose from the first update() stick instead.
+    const instance = skeleton.getInstance(instHandle)!;
+    instance.localPosX[1] = 999;
+    skeleton.update(1 / 60);
+
+    expect(skeleton.getBoneWorldPose(instHandle, 1)!.px).toBeCloseTo(5);
+
+    // Marking it dirty again should make the new value take effect on the following update.
+    instance.markLocalDirty(1);
+    skeleton.update(1 / 60);
+    expect(skeleton.getBoneWorldPose(instHandle, 1)!.px).toBeCloseTo(999);
+  });
 });
 
 // ---------------------------------------------------------------------------

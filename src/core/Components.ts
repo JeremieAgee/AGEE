@@ -41,6 +41,11 @@ export const Collider = defineComponent("Collider", {
 export const MeshRenderer = defineComponent("MeshRenderer", {
   meshRef: "ref",
   visible: "bool",
+  // Set when a GPU-native twin of this THREE.Object3D (see GPUMeshRenderer) already
+  // draws it — keeps the THREE-side draw suppressed without touching `visible`, which
+  // stays the single source of truth for "is this entity supposed to be shown at all"
+  // for both the THREE and GPU-native paths (see CullingSystem).
+  skipThreeDraw: "bool",
   castShadow: "bool",
   receiveShadow: "bool",
 });

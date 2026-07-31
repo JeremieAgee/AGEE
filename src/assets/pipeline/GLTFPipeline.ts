@@ -9,7 +9,7 @@ import { GPUMesh } from "../../gpu/GPUMesh";
 import type { GPUMaterialPool } from "../../gpu/GPUMaterialPool";
 import { extractGeometry } from "../../gpu/ThreeGeometryAdapter";
 import { AssetSystem } from "../AssetSystem";
-import { AssetType, AssetHandle, AssetId } from "../AssetTypes";
+import { AssetType, AssetHandle, AssetId, INVALID_ASSET } from "../AssetTypes";
 
 export interface GLTFAsset {
   meshes: AssetHandle[];
@@ -34,6 +34,17 @@ export class GLTFPipeline {
   private loader = new GLTFLoader();
   private assets: AssetSystem;
   private gpuTarget: GPUTarget | null = null;
+  // Tracks a load() call already in flight for a given id, mirroring AssetSystem.load()'s own
+  // cache-hit/inflight handling for plain assets (see AssetSystem.ts). Without this, a second
+  // caller loading the same GLTF id before (or after) the first has finished re-runs the whole
+  // fetch/parse/register pass: every mesh/material/animation dependency gets registered again
+  // under the same id (a no-op, register() dedupes by id) but is still retain()'d and pushed
+  // into the dependency list a second time, and setLoaded() overwrites the previously-parsed
+  // geometry/material data with the freshly-parsed one without disposing the original —
+  // leaking it, since nothing else held a reference to dispose it. Routing repeat/concurrent
+  // callers through this cache instead makes a shared GLTF asset retain-counted like every
+  // other asset type: N callers means N retains on the one real load, not N independent loads.
+  private inflight = new Map<AssetId, Promise<GLTFAsset>>();
 
   constructor(assets: AssetSystem) {
     this.assets = assets;
@@ -45,17 +56,43 @@ export class GLTFPipeline {
   }
 
   async load(id: AssetId, path: string): Promise<GLTFAsset> {
+    const existingHandle = this.assets.store.getHandleById(id);
+    if (existingHandle !== INVALID_ASSET && this.assets.store.isLoaded(existingHandle)) {
+      // Cache-hit: this caller is a distinct owner and must retain just like a cold load
+      // does, or its later release() would over-release an asset another owner still holds.
+      this.assets.store.retain(existingHandle);
+      return this.assets.store.getData<GLTFAsset>(existingHandle) as GLTFAsset;
+    }
+
+    const inflightLoad = this.inflight.get(id);
+    if (inflightLoad) {
+      // Another caller's load of this same id is already in progress; this caller becomes a
+      // second owner of the same eventual result and must retain too. loadAndRegister() only
+      // retains once (for whichever call actually performs it), so this call must retain on
+      // its own behalf rather than skip it.
+      if (existingHandle !== INVALID_ASSET) this.assets.store.retain(existingHandle);
+      return inflightLoad;
+    }
+
     const gltfHandle = this.assets.registerGLTF(id, path);
     this.assets.store.setLoading(gltfHandle);
 
-    try {
-      return await this.loadAndRegister(gltfHandle, id, path);
-    } catch (err) {
+    const promise = this.loadAndRegister(gltfHandle, id, path).catch((err) => {
       // Without this, a failed fetch/parse leaves the asset stuck in LoadStatus.Loading
       // forever — isReady()/getStatus() callers never see it transition to Failed.
       this.assets.store.setFailed(gltfHandle, err instanceof Error ? err.message : String(err));
       throw err;
-    }
+    });
+    this.inflight.set(id, promise);
+    // See AssetSystem.load()'s identical fix: `.then(cleanup, cleanup)` rather than
+    // `.finally(cleanup)` so a failed load's rejection doesn't also surface as a second,
+    // uncatchable "unhandled rejection" from the discarded derived promise `.finally()` would
+    // produce.
+    promise.then(
+      () => this.inflight.delete(id),
+      () => this.inflight.delete(id)
+    );
+    return promise;
   }
 
   private async loadAndRegister(gltfHandle: AssetHandle, id: AssetId, path: string): Promise<GLTFAsset> {
@@ -200,8 +237,9 @@ export class GLTFPipeline {
 
       // Try to hand this mesh's geometry/material to the GPU-native pipeline. Three.js's
       // copy of the mesh is kept as a fallback (and for physics/culling bookkeeping that
-      // still reads MeshRenderer), but its `visible` flag is cleared so it doesn't get
-      // double-drawn once the GPU-native path is active for it.
+      // still reads MeshRenderer), with `skipThreeDraw` set so CullingSystem/RenderSystem
+      // suppress the THREE-side draw without touching `visible` (which stays the shared
+      // on/off switch for both the THREE and GPU-native draw paths).
       let gpuAttached = false;
       if (this.gpuTarget) {
         try {
@@ -233,7 +271,8 @@ export class GLTFPipeline {
 
       world.addComponent(eid, MeshRenderer, {
         meshRef: obj,
-        visible: gpuAttached ? 0 : 1,
+        visible: 1,
+        skipThreeDraw: gpuAttached ? 1 : 0,
         castShadow: 1,
         receiveShadow: 1,
       });

@@ -8,6 +8,7 @@ import { InputBuffer } from "./InputBuffer";
 import { InterestManager } from "./InterestManager";
 import {
   ComponentRegistry,
+  ActionRegistry,
   writeInput,
   writeSnapshot,
   writeDeltaSnapshot,
@@ -43,6 +44,7 @@ export class NetworkSendSystem extends System {
   private transport!: Transport;
   private snapshotManager!: SnapshotManager;
   private registry!: ComponentRegistry;
+  private actions!: ActionRegistry;
   private inputBuffer!: InputBuffer;
   private interestManager: InterestManager | null = null;
   private role: NetworkRole = "client";
@@ -71,12 +73,14 @@ export class NetworkSendSystem extends System {
     registry: ComponentRegistry,
     inputBuffer: InputBuffer,
     role: NetworkRole,
+    actions: ActionRegistry,
   ): void {
     this.transport = transport;
     this.snapshotManager = snapshotManager;
     this.registry = registry;
     this.inputBuffer = inputBuffer;
     this.role = role;
+    this.actions = actions;
   }
 
   setInterestManager(manager: InterestManager): void {
@@ -133,7 +137,7 @@ export class NetworkSendSystem extends System {
         if (typeof transportWithPing.sendPing === "function") {
           transportWithPing.sendPing();
         }
-        this.writer = new BinaryWriter(16);
+        this.writer.reset();
         writePing(this.writer, timestamp);
         this.transport.send(this.writer.toArrayBuffer());
       }
@@ -147,8 +151,8 @@ export class NetworkSendSystem extends System {
     input.tick = this._currentTick;
     this.inputBuffer.push(input);
 
-    this.writer = new BinaryWriter(256);
-    writeInput(this.writer, input);
+    this.writer.reset();
+    writeInput(this.writer, input, this.actions);
     this.transport.send(this.writer.toArrayBuffer());
   }
 
@@ -167,7 +171,7 @@ export class NetworkSendSystem extends System {
         );
       }
 
-      this.writer = new BinaryWriter(4096);
+      this.writer.reset();
 
       // Diff against what this client's own last filtered view actually was, not a shared
       // unfiltered snapshot looked up by tick — otherwise an entity that only just entered
@@ -219,7 +223,7 @@ export class NetworkSendSystem extends System {
   }
 
   sendInputAck(clientTransport: Transport, tick: number): void {
-    this.writer = new BinaryWriter(16);
+    this.writer.reset();
     writeInputAck(this.writer, tick);
     clientTransport.send(this.writer.toArrayBuffer());
   }

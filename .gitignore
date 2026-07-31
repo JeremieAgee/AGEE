@@ -1,2 +1,8 @@
 node_modules/
 dist/
+
+# Local environment overrides — never commit these, even when they look inert;
+# they're project-specific and can carry secrets.
+.env
+.env.*
+!.env.example

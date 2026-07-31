@@ -361,6 +361,47 @@ describe("InputSystem", () => {
     expect(input.mouse.dy).toBe(0);
   });
 
+  it("window blur releases all held keys and mouse buttons", () => {
+    const { el, input } = makeInput();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "w" }));
+    el.dispatchEvent(new MouseEvent("mousedown", { button: 0 }));
+    input.endFrame(); // clear this-frame press flags so only the blur's effect is observed
+
+    window.dispatchEvent(new Event("blur"));
+
+    // Alt-tabbing away never fires a matching keyup/mouseup (that happens outside the page),
+    // so without an explicit release-on-blur, isKeyDown()/isMouseDown() would keep reporting
+    // "w"/button 0 as held indefinitely even after focus returns.
+    expect(input.isKeyDown("w")).toBe(false);
+    expect(input.isKeyReleased("w")).toBe(true);
+    expect(input.isKeyBuffered("w")).toBe(false);
+    expect(input.isMouseDown(0)).toBe(false);
+    expect(input.isMouseReleased(0)).toBe(true);
+  });
+
+  it("tab backgrounding (visibilitychange while hidden) also releases held inputs", () => {
+    const { input } = makeInput();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "a" }));
+    input.endFrame();
+
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    expect(input.isKeyDown("a")).toBe(false);
+    expect(input.isKeyReleased("a")).toBe(true);
+  });
+
+  it("visibilitychange while still visible does not release held inputs", () => {
+    const { input } = makeInput();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "s" }));
+    input.endFrame();
+
+    vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    document.dispatchEvent(new Event("visibilitychange"));
+
+    expect(input.isKeyDown("s")).toBe(true);
+  });
+
   it("requestPointerLock()/exitPointerLock() delegate to the DOM APIs", () => {
     const { el, input } = makeInput();
     el.requestPointerLock = vi.fn();
@@ -410,6 +451,22 @@ describe("InputSystem", () => {
 
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "z" }));
     expect(input.isKeyDown("z")).toBe(false);
+  });
+
+  it("destroy() also detaches the wheel and contextmenu listeners", () => {
+    const { el, input } = makeInput();
+    input.destroy();
+
+    el.dispatchEvent(new WheelEvent("wheel", { deltaY: 5 }));
+    expect(input.mouse.wheel).toBe(0);
+
+    // contextmenu's preventDefault() used to be registered via an inline arrow function that
+    // was never stored anywhere, so destroy() had no reference to pass to
+    // removeEventListener() and could never actually detach it — right-click would keep
+    // opening the browser context menu after destroy().
+    const event = new Event("contextmenu", { cancelable: true });
+    el.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
   });
 });
 

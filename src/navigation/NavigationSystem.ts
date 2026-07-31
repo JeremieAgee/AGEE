@@ -54,6 +54,15 @@ export class NavigationSystem extends System {
   private nextPathSlot = 0;
   private maxPaths: number;
 
+  // Fixed-timestep accumulator, matching PhysicsSystem's model: without this, waypoint
+  // movement integrated directly against the variable per-frame dt, so identical elapsed
+  // wall-clock time produced different simulated results depending on how it was chopped
+  // into frames — breaking determinism for anything relying on it (multiplayer
+  // reconciliation, replays).
+  private static readonly FIXED_STEP = 1 / 60;
+  private static readonly MAX_SUBSTEPS = 8;
+  private accumulator = 0;
+
   constructor(maxPaths: number = 256) {
     super();
     this.maxPaths = maxPaths;
@@ -238,6 +247,18 @@ export class NavigationSystem extends System {
   // Hot loop — pure SOA column reads for movement
   update(dt: number): void {
     const entities = this.query.entities;
+    if (entities.length === 0) return;
+
+    this.accumulator += dt;
+    let steps = 0;
+    while (this.accumulator >= NavigationSystem.FIXED_STEP && steps < NavigationSystem.MAX_SUBSTEPS) {
+      this.stepOnce(entities, NavigationSystem.FIXED_STEP);
+      this.accumulator -= NavigationSystem.FIXED_STEP;
+      steps++;
+    }
+  }
+
+  private stepOnce(entities: number[], dt: number): void {
     const hasTargets = this.navStore.getColumn("hasTarget");
     const speeds = this.navStore.getColumn("speed");
     const stopDists = this.navStore.getColumn("stoppingDistance");

@@ -1,4 +1,5 @@
 import { System } from "../ecs";
+import { resolveUIOverlay } from "./Widget";
 
 interface UIWidget {
   id: string;
@@ -6,6 +7,9 @@ interface UIWidget {
   update?: (dt: number) => void;
 }
 
+// This is the widget system Engine wires up by default (`AGEE.ui`). It's a separate, simpler
+// API from UIManager/Widget's retained-mode tree — the two don't share state or overlay
+// lifecycle, so don't assume they compose.
 export class UISystem extends System {
   priority = 950;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "render";
@@ -15,9 +19,14 @@ export class UISystem extends System {
 
   constructor(overlayId: string = "ui-overlay") {
     super();
-    this.overlay = document.getElementById(overlayId) ?? document.body;
+    this.overlay = resolveUIOverlay(overlayId);
   }
 
+  /**
+   * `html` is inserted via innerHTML as-is. Any untrusted content interpolated into it (player
+   * names, chat text, etc.) must be run through `escapeHtml()` from `./Widget` first, or this
+   * is an XSS vector.
+   */
   addWidget(
     id: string,
     html: string,

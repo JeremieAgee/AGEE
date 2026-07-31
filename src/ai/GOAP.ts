@@ -1,3 +1,5 @@
+import { MinHeap } from "../core/BinaryHeap";
+
 export type WorldState = Map<string, number | boolean>;
 export type GOAPActionFn = (eid: number, dt: number, state: WorldState) => "running" | "done" | "failed";
 
@@ -71,50 +73,6 @@ interface PlanNode {
   cost: number;
   parent: PlanNode | null;
   depth: number;
-}
-
-// Small binary min-heap over PlanNode.cost. GOAP's search never needs to decrease an
-// in-heap node's key (a cheaper route to an already-queued state is just pushed as a new
-// node and the stale one is filtered out on pop via bestCostForState) so push/pop is all
-// this needs.
-class PlanNodeHeap {
-  private nodes: PlanNode[] = [];
-
-  get length(): number { return this.nodes.length; }
-
-  push(node: PlanNode): void {
-    const nodes = this.nodes;
-    nodes.push(node);
-    let i = nodes.length - 1;
-    while (i > 0) {
-      const parent = (i - 1) >> 1;
-      if (nodes[parent].cost <= nodes[i].cost) break;
-      const tmp = nodes[parent]; nodes[parent] = nodes[i]; nodes[i] = tmp;
-      i = parent;
-    }
-  }
-
-  pop(): PlanNode | undefined {
-    const nodes = this.nodes;
-    if (nodes.length === 0) return undefined;
-    const top = nodes[0];
-    const last = nodes.pop();
-    if (nodes.length > 0 && last !== undefined) {
-      nodes[0] = last;
-      let i = 0;
-      const n = nodes.length;
-      while (true) {
-        const left = 2 * i + 1, right = 2 * i + 2;
-        let smallest = i;
-        if (left < n && nodes[left].cost < nodes[smallest].cost) smallest = left;
-        if (right < n && nodes[right].cost < nodes[smallest].cost) smallest = right;
-        if (smallest === i) break;
-        const tmp = nodes[smallest]; nodes[smallest] = nodes[i]; nodes[i] = tmp;
-        i = smallest;
-      }
-    }
-    return top;
-  }
 }
 
 export interface GOAPInstance {
@@ -221,14 +179,27 @@ export class GOAPPlanner {
 
   plan(actions: GOAPAction[], currentState: WorldState, goalState: WorldState): GOAPAction[] {
     const start: PlanNode = { state: new Map(currentState), action: null, cost: 0, parent: null, depth: 0 };
-    const open = new PlanNodeHeap();
-    open.push(start);
+    // GOAP's search never needs to decrease an in-heap node's key (a cheaper route to an
+    // already-queued state is just pushed as a new node and the stale one is filtered out on
+    // pop via bestCostForState) so the plain shared MinHeap — push/pop keyed by cost, no
+    // decrease-key/contains — is all this needs.
+    const open = new MinHeap<PlanNode>();
+    open.push(start, start.cost);
+    // Fixed, pre-sorted list of every key that can ever appear in a state reached from
+    // `start` (a successor state only ever gains keys via action.effects, never loses any —
+    // see the plain `new Map(current.state)` + `.set()` below). Computed once per plan() call
+    // so stateKey() below can build a canonical string by walking this instead of re-deriving
+    // and re-sorting `Array.from(state.keys())` from scratch on every single node, which was
+    // the search's dominant source of allocation churn (called for every expanded node and
+    // every one of its successors, with maxIterations up to 500 and one GOAP instance replanning
+    // per active agent).
+    const stateKeys = this.collectStateKeys(actions, currentState, goalState);
     // Best known cost to reach an equivalent world state, keyed by a canonical serialization
     // of that state's entries. Without this, the same state reached via two different action
     // orderings gets expanded again independently, burning most of the iteration budget on
     // duplicate work instead of exploring new states.
     const bestCostForState = new Map<string, number>();
-    bestCostForState.set(this.stateKey(start.state), 0);
+    bestCostForState.set(this.stateKey(start.state, stateKeys), 0);
     let iterations = 0;
 
     let bestNode: PlanNode | null = null;
@@ -241,7 +212,7 @@ export class GOAPPlanner {
 
       // A cheaper route to this same state was already found after this entry was queued —
       // it's stale, skip it rather than re-expanding.
-      const key = this.stateKey(current.state);
+      const key = this.stateKey(current.state, stateKeys);
       if (current.cost > (bestCostForState.get(key) ?? Infinity)) continue;
 
       if (this.stateContains(current.state, goalState)) {
@@ -263,18 +234,19 @@ export class GOAPPlanner {
         }
 
         const newCost = current.cost + action.cost;
-        const newKey = this.stateKey(newState);
+        const newKey = this.stateKey(newState, stateKeys);
         const known = bestCostForState.get(newKey);
         if (known !== undefined && known <= newCost) continue;
         bestCostForState.set(newKey, newCost);
 
-        open.push({
+        const newNode: PlanNode = {
           state: newState,
           action,
           cost: newCost,
           parent: current,
           depth: current.depth + 1,
-        });
+        };
+        open.push(newNode, newNode.cost);
       }
     }
 
@@ -289,13 +261,31 @@ export class GOAPPlanner {
     return result;
   }
 
+  // Every key that could ever appear in a state reachable from currentState during this
+  // plan() call: the starting keys, the goal's keys (so goal-only conditions still contribute
+  // to the canonical key), and every action's precondition/effect keys (the only way a new
+  // key can ever get introduced into a successor state). Sorted once and reused by every
+  // stateKey() call for the rest of this search.
+  private collectStateKeys(actions: GOAPAction[], currentState: WorldState, goalState: WorldState): string[] {
+    const keys = new Set<string>();
+    for (const k of currentState.keys()) keys.add(k);
+    for (const k of goalState.keys()) keys.add(k);
+    for (const action of actions) {
+      for (const k of action.preconditions.keys()) keys.add(k);
+      for (const k of action.effects.keys()) keys.add(k);
+    }
+    return Array.from(keys).sort();
+  }
+
   /** Canonical string key for a world state, independent of Map insertion order — different
    *  action orderings can reach the same key/value content via different insertion
-   *  sequences, and the closed-set above needs those to compare equal. */
-  private stateKey(state: WorldState): string {
-    const keys = Array.from(state.keys()).sort();
+   *  sequences, and the closed-set above needs those to compare equal. `keys` must be a
+   *  superset of every key `state` could contain (see collectStateKeys). */
+  private stateKey(state: WorldState, keys: string[]): string {
     let out = "";
-    for (const k of keys) out += k + "=" + state.get(k) + "|";
+    for (const k of keys) {
+      if (state.has(k)) out += k + "=" + state.get(k) + "|";
+    }
     return out;
   }
 

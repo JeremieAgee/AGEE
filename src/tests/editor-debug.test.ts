@@ -6,6 +6,8 @@ import { EditorOverlay } from "../editor/EditorOverlay";
 import { DebugInspector } from "../systems/debug/DebugInspector";
 import { DebugOverlay } from "../systems/debug/DebugOverlay";
 import { DevConsole } from "../systems/debug/DevConsole";
+import { AIDebugPanel } from "../ai/AIDebugPanel";
+import { Blackboard } from "../ai/BehaviorTree";
 import { World } from "../ecs";
 import { Transform } from "../core/Components";
 
@@ -325,5 +327,50 @@ describe("DevConsole", () => {
     const { devConsole } = makeConsole();
     devConsole.destroy();
     expect(document.getElementById("dev-console")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AIDebugPanel — AUDIT (fixed): renderBlackboard() interpolated arbitrary blackboard
+// values/keys straight into an innerHTML string with no escaping. A blackboard is a plain
+// `Map<string, any>` any AI/game code can write into at runtime (not a typed ECS component
+// field), so a string value sourced from untrusted input (chat text, a player display name,
+// etc.) could inject live markup into the debug panel. Same issue for FSM/Utility/GOAP name
+// strings, fixed the same way.
+// ---------------------------------------------------------------------------
+
+describe("AIDebugPanel", () => {
+  function makePanel() {
+    const world = new World();
+    const panel = new AIDebugPanel();
+    world.addSystem(panel);
+    panel.show();
+    return { world, panel };
+  }
+
+  it("escapes blackboard string values before interpolating them into the panel's innerHTML", () => {
+    const { panel } = makePanel();
+    const bb = new Blackboard();
+    bb.set("lastMessage", '<img src=x onerror="window.__pwned = true">');
+    panel.track(1, "goblin", { blackboard: bb });
+
+    panel.update(1); // > refreshRate, forces a refresh
+
+    const content = document.getElementById("ai-debug-content")!;
+    expect(content.innerHTML).not.toContain("<img");
+    expect(content.innerHTML).toContain("&lt;img");
+    expect(content.querySelector("img")).toBeNull();
+  });
+
+  it("escapes blackboard keys the same way", () => {
+    const { panel } = makePanel();
+    const bb = new Blackboard();
+    bb.set('"><script>window.__pwned = true</script>', "value");
+    panel.track(2, "goblin", { blackboard: bb });
+
+    panel.update(1);
+
+    const content = document.getElementById("ai-debug-content")!;
+    expect(content.querySelector("script")).toBeNull();
   });
 });

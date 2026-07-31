@@ -2,6 +2,8 @@ import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { System } from "../ecs";
 import { NoiseGenerator, NoiseConfig } from "./NoiseGenerator";
+import { buildChunkData, ChunkBuildResult } from "./TerrainChunkBuilder";
+import { TerrainWorkerClient } from "./TerrainWorkerClient";
 
 export interface TerrainConfig {
   chunkSize: number;
@@ -74,12 +76,23 @@ export class TerrainSystem extends System {
   // per update() call instead of all at once.
   private pendingLoads: { cx: number; cz: number }[] = [];
   private pendingSet = new Set<string>();
+  // Coordinates whose build request has been dispatched (to the worker, or run inline) but
+  // hasn't resolved into a loaded chunk yet — kept distinct from pendingSet so the recompute in
+  // update() doesn't re-queue a chunk that's already in flight.
+  private loadingChunks = new Set<string>();
+  // Snapshot of `needed` from the last recompute in update(), kept as a field (rather than a
+  // local) so an async worker response arriving after the camera has moved away can tell it's
+  // no longer wanted and discard its result instead of loading a chunk nobody needs anymore.
+  private wantedChunks = new Set<string>();
+  private workerClient: TerrainWorkerClient;
 
-  constructor(config: Partial<TerrainConfig> = {}) {
+  constructor(config: Partial<TerrainConfig> = {}, workerClient?: TerrainWorkerClient) {
     super();
     this.config = { ...DEFAULT_TERRAIN_CONFIG, ...config };
     this.noise = new NoiseGenerator(this.config.noise);
     this.maxChunks = MAX_CHUNKS;
+    // Injectable for tests (a fake Worker); production callers just let this feature-detect.
+    this.workerClient = workerClient ?? new TerrainWorkerClient();
 
     this.chunkCX = new Int32Array(this.maxChunks);
     this.chunkCZ = new Int32Array(this.maxChunks);
@@ -193,12 +206,14 @@ export class TerrainSystem extends System {
           const key = `${cx},${cz}`;
           needed.add(key);
 
-          if (!this.coordToSlot.has(key) && !this.pendingSet.has(key)) {
+          if (!this.coordToSlot.has(key) && !this.pendingSet.has(key) && !this.loadingChunks.has(key)) {
             this.pendingSet.add(key);
             this.pendingLoads.push({ cx, cz });
           }
         }
       }
+
+      this.wantedChunks = needed;
 
       // Nearest chunks load first, and any chunk that's fallen out of range while still
       // queued (e.g. the camera moved past it before it loaded) is dropped rather than
@@ -222,11 +237,13 @@ export class TerrainSystem extends System {
     }
 
     const budget = Math.max(1, this.config.maxChunkLoadsPerFrame);
+    const deadline = performance.now() + Math.max(0, this.config.maxChunkLoadMs);
     for (let i = 0; i < budget && this.pendingLoads.length > 0; i++) {
+      if (i > 0 && performance.now() >= deadline) break;
       const { cx, cz } = this.pendingLoads.shift()!;
       this.pendingSet.delete(`${cx},${cz}`);
       if (!this.coordToSlot.has(`${cx},${cz}`)) {
-        this.loadChunk(cx, cz);
+        this.beginLoadChunk(cx, cz);
       }
     }
   }
@@ -243,101 +260,74 @@ export class TerrainSystem extends System {
     return Math.max(2, Math.round((base - 1) / 4) + 1);
   }
 
-  // Computes per-vertex normals from the height field analytically (central
-  // differences of world-space height samples) instead of averaging face
-  // normals of the local mesh only. Any sample that falls outside this
-  // chunk's own heightmap is pulled from the shared noise function at that
-  // exact world position rather than from the neighboring chunk's heightmap
-  // array, so two adjacent chunks evaluate identical world-space height
-  // samples on either side of their shared edge and therefore produce
-  // matching (seamless) normals at the boundary, even though each chunk
-  // builds its geometry independently.
-  private computeHeightFieldNormals(
-    hm: Float32Array,
-    res: number,
-    worldX: number,
-    worldZ: number,
-    step: number
-  ): Float32Array {
-    const normals = new Float32Array(res * res * 3);
+  // Dispatches the actual chunk generation (see TerrainChunkBuilder.buildChunkData — noise
+  // sampling + vertex/UV/index/normal computation, the real CPU cost) either to the terrain
+  // worker when one is active, or inline on the main thread as a synchronous fallback. Either
+  // way, the slot isn't allocated and nothing is added to the scene/physics world until
+  // finalizeChunk() runs — with the worker path that happens later, asynchronously, once the
+  // response arrives; with the inline path it happens synchronously within this same call.
+  private beginLoadChunk(cx: number, cz: number): void {
+    const key = `${cx},${cz}`;
+    this.loadingChunks.add(key);
 
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const hL = x > 0 ? hm[z * res + (x - 1)] : this.noise.sample(worldX + (x - 1) * step, worldZ + z * step);
-        const hR = x < res - 1 ? hm[z * res + (x + 1)] : this.noise.sample(worldX + (x + 1) * step, worldZ + z * step);
-        const hD = z > 0 ? hm[(z - 1) * res + x] : this.noise.sample(worldX + x * step, worldZ + (z - 1) * step);
-        const hU = z < res - 1 ? hm[(z + 1) * res + x] : this.noise.sample(worldX + x * step, worldZ + (z + 1) * step);
+    const cs = this.config.chunkSize;
+    const worldX = cx * cs;
+    const worldZ = cz * cs;
+    const centerX = worldX + cs / 2;
+    const centerZ = worldZ + cs / 2;
+    const distance = Math.hypot(centerX - this.cameraX, centerZ - this.cameraZ);
+    const res = this.computeLODResolution(distance);
 
-        const dhdx = (hR - hL) / (2 * step);
-        const dhdz = (hU - hD) / (2 * step);
+    const request = {
+      cx, cz,
+      chunkSize: cs,
+      resolution: res,
+      noise: this.noise.config,
+      buildCollider: !!(this.config.colliders && this.rapierWorld),
+    };
 
-        const nx = -dhdx;
-        const ny = 1;
-        const nz = -dhdz;
-        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-
-        const i = (z * res + x) * 3;
-        normals[i] = nx / len;
-        normals[i + 1] = ny / len;
-        normals[i + 2] = nz / len;
-      }
+    if (this.workerClient.active) {
+      this.workerClient.build(request)
+        .then((result) => this.onChunkBuilt(key, cx, cz, res, result))
+        .catch((err) => {
+          this.loadingChunks.delete(key);
+          console.error(`[AGEE] Terrain worker failed to build chunk (${cx},${cz}):`, err);
+        });
+    } else {
+      const result = buildChunkData(request);
+      this.onChunkBuilt(key, cx, cz, res, result);
     }
-
-    return normals;
   }
 
-  private loadChunk(cx: number, cz: number): void {
+  private onChunkBuilt(key: string, cx: number, cz: number, res: number, result: ChunkBuildResult): void {
+    this.loadingChunks.delete(key);
+
+    // The camera may have moved on (or this exact chunk may already have been loaded via
+    // another path) while an async worker build was in flight — discard rather than adding a
+    // chunk that's no longer wanted, or double-loading one that already exists.
+    if (this.coordToSlot.has(key)) return;
+    if (!this.wantedChunks.has(key)) return;
+
+    this.finalizeChunk(cx, cz, res, result);
+  }
+
+  private finalizeChunk(cx: number, cz: number, res: number, result: ChunkBuildResult): void {
     const slot = this.allocSlot();
     const cs = this.config.chunkSize;
     const worldX = cx * cs;
     const worldZ = cz * cs;
 
-    const centerX = worldX + cs / 2;
-    const centerZ = worldZ + cs / 2;
-    const distance = Math.hypot(centerX - this.cameraX, centerZ - this.cameraZ);
-    const res = this.computeLODResolution(distance);
     this.chunkResolutions[slot] = res;
-
     this.chunkCX[slot] = cx;
     this.chunkCZ[slot] = cz;
     this.chunkActive[slot] = 1;
+    this.chunkHeightmaps[slot] = result.heightmap;
 
-    const hm = new Float32Array(res * res);
-    this.noise.fillHeightmap(hm, res, worldX, worldZ, cs);
-    this.chunkHeightmaps[slot] = hm;
-
-    // Build mesh
     const geo = new THREE.BufferGeometry();
-    const step = cs / (res - 1);
-    const positions = new Float32Array(res * res * 3);
-    const uvs = new Float32Array(res * res * 2);
-
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const i = z * res + x;
-        positions[i * 3] = x * step;
-        positions[i * 3 + 1] = hm[i];
-        positions[i * 3 + 2] = z * step;
-        uvs[i * 2] = x / (res - 1);
-        uvs[i * 2 + 1] = z / (res - 1);
-      }
-    }
-
-    const indices: number[] = [];
-    for (let z = 0; z < res - 1; z++) {
-      for (let x = 0; x < res - 1; x++) {
-        const tl = z * res + x;
-        indices.push(tl, (z + 1) * res + x, tl + 1);
-        indices.push(tl + 1, (z + 1) * res + x, (z + 1) * res + x + 1);
-      }
-    }
-
-    const normals = this.computeHeightFieldNormals(hm, res, worldX, worldZ, step);
-
-    geo.setIndex(indices);
-    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-    geo.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+    geo.setIndex(new THREE.BufferAttribute(result.indices, 1));
+    geo.setAttribute("position", new THREE.BufferAttribute(result.positions, 3));
+    geo.setAttribute("uv", new THREE.BufferAttribute(result.uvs, 2));
+    geo.setAttribute("normal", new THREE.BufferAttribute(result.normals, 3));
 
     const mesh = new THREE.Mesh(geo, this.material);
     mesh.position.set(worldX, 0, worldZ);
@@ -345,47 +335,15 @@ export class TerrainSystem extends System {
     this.scene.add(mesh);
     this.chunkMeshes[slot] = mesh;
 
-    // Build physics collider
-    if (this.config.colliders && this.rapierWorld) {
-      this.createChunkCollider(slot, cx, cz, hm, res);
+    if (this.config.colliders && this.rapierWorld && result.colliderVertices && result.colliderIndices) {
+      this.createChunkCollider(slot, result.colliderVertices, result.colliderIndices);
     }
 
     this.coordToSlot.set(`${cx},${cz}`, slot);
   }
 
-  private createChunkCollider(slot: number, cx: number, cz: number, hm: Float32Array, res: number): void {
+  private createChunkCollider(slot: number, vertices: Float32Array, indices: Uint32Array): void {
     if (!this.rapierWorld) return;
-
-    const cs = this.config.chunkSize;
-    const step = cs / (res - 1);
-    const worldX = cx * cs;
-    const worldZ = cz * cs;
-
-    // Build trimesh from exact same geometry as the visual mesh
-    // Guarantees physics surface matches visual surface exactly
-    const vertices = new Float32Array(res * res * 3);
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const i = z * res + x;
-        vertices[i * 3] = worldX + x * step;
-        vertices[i * 3 + 1] = hm[i];
-        vertices[i * 3 + 2] = worldZ + z * step;
-      }
-    }
-
-    const indices = new Uint32Array((res - 1) * (res - 1) * 6);
-    let idx = 0;
-    for (let z = 0; z < res - 1; z++) {
-      for (let x = 0; x < res - 1; x++) {
-        const tl = z * res + x;
-        indices[idx++] = tl;
-        indices[idx++] = (z + 1) * res + x;
-        indices[idx++] = tl + 1;
-        indices[idx++] = tl + 1;
-        indices[idx++] = (z + 1) * res + x;
-        indices[idx++] = (z + 1) * res + x + 1;
-      }
-    }
 
     const bodyDesc = RAPIER.RigidBodyDesc.fixed()
       .setTranslation(0, 0, 0);
@@ -433,5 +391,6 @@ export class TerrainSystem extends System {
     for (const [key, slot] of this.coordToSlot) {
       this.unloadChunk(slot, key);
     }
+    this.workerClient.destroy();
   }
 }

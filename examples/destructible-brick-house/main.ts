@@ -137,7 +137,7 @@ async function main(): Promise<void> {
   const hud = createHUD("Destructible Brick House", [
     "Left-drag to orbit, scroll to zoom",
     "Right-click to fire a wrecking ball",
-    "I = inspector, F3 = perf, ` = console",
+    "` = dev console (F3/I need EDITOR=true)",
   ]);
 
   const resetBtn = document.createElement("button");
@@ -174,6 +174,8 @@ async function main(): Promise<void> {
     hud.setLine("toppled", `Bricks toppled: ${toppled} / ${house.length}`);
     hud.setLine("projectiles", `Active projectiles: ${projectiles.length}`);
   });
+
+  engine.start();
 }
 
 main().catch((err) => {

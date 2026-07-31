@@ -66,6 +66,11 @@ export class AssetStore {
   }
 
   addDependency(handle: AssetHandle, depHandle: AssetHandle): void {
+    // Guards against double-registering the same dependency (e.g. a caller re-running a
+    // load pass for an id that's already registered) — without this, release() would walk
+    // the duplicate entry and release depHandle an extra time it was never actually
+    // retained for, over-releasing it out from under whatever still legitimately holds it.
+    if (this._dependencies[handle].includes(depHandle)) return;
     this._dependencies[handle].push(depHandle);
   }
 

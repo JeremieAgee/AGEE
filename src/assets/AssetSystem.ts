@@ -80,7 +80,17 @@ export class AssetSystem extends System {
     }
 
     this.inflight.set(handle, promise);
-    promise.finally(() => this.inflight.delete(handle));
+    // Not `promise.finally(...)`: its return value is a *new* derived promise that rejects
+    // whenever `promise` does, and since nothing here holds onto or catches that derived
+    // promise, a failed load (e.g. the GLTF-type rejection above, or any texture/audio/generic
+    // load failure) surfaces as an extra, uncatchable "unhandled rejection" regardless of
+    // whether the caller awaits/catches load()'s own return value. `.then(cleanup, cleanup)`
+    // handles both branches itself, so its derived promise always resolves and there's nothing
+    // left unhandled.
+    promise.then(
+      () => this.inflight.delete(handle),
+      () => this.inflight.delete(handle)
+    );
     return promise;
   }
 

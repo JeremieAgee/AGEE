@@ -8,6 +8,7 @@ import { SnapshotManager } from "./SnapshotManager";
 import { InputBuffer } from "./InputBuffer";
 import {
   ComponentRegistry,
+  ActionRegistry,
   readMessageHeader,
   readConnectAck,
   readSnapshot,
@@ -40,6 +41,7 @@ export class NetworkReceiveSystem extends System {
   private transport!: Transport;
   private snapshotManager!: SnapshotManager;
   private registry!: ComponentRegistry;
+  private actions!: ActionRegistry;
   private inputBuffer!: InputBuffer;
   private role: NetworkRole = "client";
 
@@ -85,6 +87,27 @@ export class NetworkReceiveSystem extends System {
   // Client-mode: callback for prediction replay
   private _onReconcile: ((serverTick: number, inputs: InputPayload[]) => void) | null = null;
 
+  // Server-mode: notified when a client's transport reports "disconnected", so the owner
+  // (NetworkManager) can clean up whatever it tracks for that client (NetworkSendSystem's
+  // connectedClients entry, etc). Without this, an ungraceful disconnect only logged a
+  // warning — connectedClients/clientTransports leaked that client's entry (and the
+  // transport/entity it referenced) indefinitely.
+  private _onClientDisconnected: ((clientId: number) => void) | null = null;
+
+  set onClientDisconnected(fn: ((clientId: number) => void) | null) {
+    this._onClientDisconnected = fn;
+  }
+
+  // Server-mode anti-replay/anti-flood: without this, nothing downstream deduplicated Input
+  // messages, so a client could resend (replay) an already-processed tick and have it applied
+  // a second time — a classic speed/duplication exploit — or flood the receive loop with input
+  // messages for the same client with no cost. lastAcceptedInputTick rejects anything at or
+  // below the highest tick already accepted for that client; inputMessageCountThisPoll caps how
+  // many Input messages a single client can get accepted per update()/poll cycle.
+  private lastAcceptedInputTick = new Map<number, number>();
+  private inputMessageCountThisPoll = new Map<number, number>();
+  private static readonly MAX_INPUTS_PER_POLL = 8;
+
   private pongWriter = new BinaryWriter(16);
 
   configure(
@@ -93,12 +116,14 @@ export class NetworkReceiveSystem extends System {
     registry: ComponentRegistry,
     inputBuffer: InputBuffer,
     role: NetworkRole,
+    actions: ActionRegistry,
   ): void {
     this.transport = transport;
     this.snapshotManager = snapshotManager;
     this.registry = registry;
     this.inputBuffer = inputBuffer;
     this.role = role;
+    this.actions = actions;
   }
 
   set localClientId(id: number) { this._localClientId = id; }
@@ -129,6 +154,7 @@ export class NetworkReceiveSystem extends System {
     if (!this.transport && this.clientTransports.size === 0) return;
 
     this.receivedInputs.length = 0;
+    this.inputMessageCountThisPoll.clear();
 
     if (this.transport) {
       const events = this.transport.poll();
@@ -156,6 +182,10 @@ export class NetworkReceiveSystem extends System {
         break;
       case "disconnected":
         console.warn("[Network] Disconnected:", ev.reason);
+        if (trustedClientId !== undefined) {
+          this.removeClientTransport(trustedClientId);
+          this._onClientDisconnected?.(trustedClientId);
+        }
         break;
       case "error":
         console.error("[Network] Transport error:", ev.error);
@@ -231,12 +261,27 @@ export class NetworkReceiveSystem extends System {
         }
 
         case MessageType.Input: {
-          const input = readInput(reader);
+          const input = readInput(reader, this.actions);
           // Never trust a wire-supplied clientId when we know which connection this
           // message actually arrived on — otherwise any client can claim to be any other
           // client and have their input routed to that player's entity.
           if (trustedClientId !== undefined) {
             input.clientId = trustedClientId;
+
+            const countThisPoll = (this.inputMessageCountThisPoll.get(trustedClientId) ?? 0) + 1;
+            this.inputMessageCountThisPoll.set(trustedClientId, countThisPoll);
+            if (countThisPoll > NetworkReceiveSystem.MAX_INPUTS_PER_POLL) {
+              console.warn(`[Network] Client ${trustedClientId} exceeded the input rate limit (${countThisPoll} messages this poll); dropping`);
+              break;
+            }
+
+            const lastTick = this.lastAcceptedInputTick.get(trustedClientId) ?? -1;
+            if (input.tick <= lastTick) {
+              // Duplicate or replayed tick (already processed, or resent) — drop instead of
+              // letting the same input get applied a second time.
+              break;
+            }
+            this.lastAcceptedInputTick.set(trustedClientId, input.tick);
           }
           this.receivedInputs.push(input);
           break;
@@ -244,7 +289,7 @@ export class NetworkReceiveSystem extends System {
 
         case MessageType.Ping: {
           const timestamp = readPingPong(reader);
-          this.pongWriter = new BinaryWriter(16);
+          this.pongWriter.reset();
           writePong(this.pongWriter, timestamp);
           sourceTransport.send(this.pongWriter.toArrayBuffer());
           break;
@@ -271,6 +316,8 @@ export class NetworkReceiveSystem extends System {
 
   removeClientTransport(clientId: number): void {
     this.clientTransports.delete(clientId);
+    this.lastAcceptedInputTick.delete(clientId);
+    this.inputMessageCountThisPoll.delete(clientId);
   }
 
   private processServerSnapshot(snapshot: Snapshot): void {

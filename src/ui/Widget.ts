@@ -23,6 +23,29 @@ export interface UIStyle {
   zIndex?: number;
 }
 
+// Escapes text for safe interpolation into an HTML string. UISystem.addWidget() and
+// UIManager.createWorldUI() both insert their `html` argument via innerHTML by design (widget
+// content is meant to be real markup, not just plain text), so any untrusted value — a player
+// display name, chat text, anything not authored by the game itself — must be run through this
+// before being interpolated into that string, or it's an XSS vector.
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Shared by UISystem and UIManager (see the "these are two independent stacks" note on each):
+// both fall back to <body> when the configured overlay id isn't present in the DOM, and both
+// used to re-implement this same one-liner independently. If a project ever does mix the two
+// stacks against the same overlayId, they at least resolve to the exact same element via one
+// code path instead of two copies that could silently drift.
+export function resolveUIOverlay(overlayId: string): HTMLElement {
+  return document.getElementById(overlayId) ?? document.body;
+}
+
 export abstract class Widget {
   id: string;
   style: UIStyle;

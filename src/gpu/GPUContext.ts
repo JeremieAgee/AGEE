@@ -98,16 +98,15 @@ export class GPUContext {
     this.canvas.height = height;
 
     if (this.depthTexture) {
-      // AUDIT FIX (bug #3): previously destroyed the old depth texture with no
-      // fence, risking a use-after-free if a still-in-flight command buffer from
-      // a prior frame references it. Request a fence from the queue before
-      // tearing it down. resize()/destroy() are synchronous APIs used throughout
-      // the engine (callers don't await them), so this can't block on the
-      // returned promise without changing that contract — it's a best-effort
-      // signal to the driver, issued (and ordered) strictly before the destroy.
-      const oldDepthTexture = this.depthTexture;
-      void this.device.queue.onSubmittedWorkDone();
-      oldDepthTexture.destroy();
+      // A prior "fence" here (`void this.device.queue.onSubmittedWorkDone()` called right
+      // before destroy()) looked protective but wasn't: the call returns a Promise that
+      // nothing awaits, so destroy() still ran on the very next line regardless of whether
+      // any GPU work was still in flight — it changed nothing. No fence is actually needed:
+      // per the WebGPU spec, destroy() invalidates the JS-side handle immediately, but the
+      // underlying GPU resource stays alive at the implementation level until any commands
+      // that already reference it have finished executing. Destroying a texture a submitted
+      // (not-yet-completed) command buffer still reads from is spec-safe.
+      this.depthTexture.destroy();
     }
 
     this.depthTexture = this.device.createTexture({
@@ -139,9 +138,7 @@ export class GPUContext {
 
   destroy(): void {
     window.removeEventListener("resize", this._onResize);
-    // AUDIT FIX (bug #3): fence before releasing the depth texture and device —
-    // see the identical rationale in resize() above.
-    void this.device.queue.onSubmittedWorkDone();
+    // See resize() above — no fence needed; destroy() is spec-safe against in-flight work.
     this.depthTexture?.destroy();
     this.device.destroy();
     // Only remove the canvas if this context created it itself — a host-supplied

@@ -105,6 +105,9 @@ export class LODSystem extends System {
 
       const activeMesh = levels[bestLevel].mesh;
       activeMesh.position.set(tx[eid], ty[eid], tz[eid]);
+      // See RenderSystem's identical fix: Transform's Euler angles are produced by this
+      // engine's ZYX-convention Quat<->Euler math, not THREE's default XYZ order.
+      activeMesh.rotation.order = "ZYX";
       activeMesh.rotation.set(
         this.transformStore.get(eid, "rx"),
         this.transformStore.get(eid, "ry"),

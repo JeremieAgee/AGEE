@@ -106,9 +106,9 @@ export class GPUMaterialPool {
   free(handle: Handle): void {
     const entry = this.entries.get(handle);
     if (entry) {
-      // AUDIT FIX (bug #3): fence before releasing the material buffer — see
-      // GPUContext.resize() for the same pattern and its rationale.
-      void this.gpuCtx.device.queue.onSubmittedWorkDone();
+      // No fence needed before releasing the material buffer — see GPUContext.resize()
+      // for why an unawaited onSubmittedWorkDone() fence here would have been a no-op
+      // anyway, and why destroy() is already spec-safe against in-flight work.
       entry.buffer.destroy();
       this.entries.free(handle);
     }

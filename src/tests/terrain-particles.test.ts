@@ -4,6 +4,8 @@ import * as THREE from "three";
 import { NoiseGenerator, SeededRandom } from "../terrain/NoiseGenerator";
 import { TerrainChunk } from "../terrain/TerrainChunk";
 import { TerrainSystem } from "../terrain/TerrainSystem";
+import { TerrainWorkerClient } from "../terrain/TerrainWorkerClient";
+import { buildChunkData, ChunkBuildRequest } from "../terrain/TerrainChunkBuilder";
 import { ParticleSystemEngine } from "../particles/ParticleSystem";
 import { World } from "../ecs";
 import { Transform, ParticleEmitter } from "../core/Components";
@@ -144,6 +146,18 @@ describe("TerrainChunk", () => {
 // TerrainSystem
 // ---------------------------------------------------------------------------
 
+// TerrainSystem.loadChunk() was split into beginLoadChunk() (dispatches chunk generation to
+// the terrain worker, or runs it inline when no Worker is available — always inline here,
+// since Node has no global Worker) + finalizeChunk() (applies the result to the scene/physics
+// world) to support offloading the actual generation work off the main thread. finalizeChunk()
+// only applies a result for a chunk still in `wantedChunks` (see onChunkBuilt) — real callers
+// populate that via update()'s camera-driven recompute, so tests that call beginLoadChunk()
+// directly need to seed it first or every load is silently discarded as "no longer wanted".
+function forceLoadChunk(ts: TerrainSystem, cx: number, cz: number): void {
+  (ts as any).wantedChunks.add(`${cx},${cz}`);
+  (ts as any).beginLoadChunk(cx, cz);
+}
+
 describe("TerrainSystem", () => {
   it("getHeightAt() falls back to raw noise sampling when no chunk is loaded at that location", () => {
     const ts = new TerrainSystem({ chunkSize: 8, resolution: 5, noise: { seed: 4 }, colliders: false });
@@ -155,7 +169,7 @@ describe("TerrainSystem", () => {
     const ts = new TerrainSystem({ chunkSize: 8, resolution: 5, noise: { seed: 4 }, colliders: false });
     ts.setScene(new THREE.Scene());
     ts.init();
-    (ts as any).loadChunk(0, 0);
+    forceLoadChunk(ts, 0, 0);
 
     const hm = (ts as any).chunkHeightmaps[0] as Float32Array;
     expect(ts.getHeightAt(0, 0)).toBeCloseTo(hm[0], 5);
@@ -194,8 +208,8 @@ describe("TerrainSystem", () => {
     const ts = new TerrainSystem({ chunkSize: 8, resolution: 9, noise: { seed: 1 }, colliders: false });
     ts.setScene(new THREE.Scene());
     ts.init();
-    (ts as any).loadChunk(0, 0); // "near" chunk
-    (ts as any).loadChunk(50, 50); // "far" chunk
+    forceLoadChunk(ts, 0, 0); // "near" chunk
+    forceLoadChunk(ts, 50, 50); // "far" chunk
 
     const meshes = (ts as any).chunkMeshes as (THREE.Mesh | null)[];
     const nearVerts = meshes[0]!.geometry.getAttribute("position").count;
@@ -216,8 +230,8 @@ describe("TerrainSystem", () => {
     const ts = new TerrainSystem({ chunkSize: cs, resolution: res, noise: { seed: 3 }, colliders: false });
     ts.setScene(new THREE.Scene());
     ts.init();
-    (ts as any).loadChunk(0, 0);
-    (ts as any).loadChunk(1, 0);
+    forceLoadChunk(ts, 0, 0);
+    forceLoadChunk(ts, 1, 0);
 
     const meshes = (ts as any).chunkMeshes as (THREE.Mesh | null)[];
     const normalsA = meshes[0]!.geometry.getAttribute("normal");
@@ -233,6 +247,109 @@ describe("TerrainSystem", () => {
     expect(normalsA.getX(idxA)).toBeCloseTo(normalsB.getX(idxB), 4);
     expect(normalsA.getY(idxA)).toBeCloseTo(normalsB.getY(idxB), 4);
     expect(normalsA.getZ(idxA)).toBeCloseTo(normalsB.getZ(idxB), 4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Terrain worker offload — chunk generation (noise + vertex/normal/index computation, the
+// actual CPU cost) can now be dispatched to a Worker instead of always running inline on the
+// main thread. Node has no global Worker, so TerrainSystem's own feature-detection always takes
+// the inline fallback in every other test above — these exercise the worker path itself via a
+// fake Worker that mimics the real terrain.worker.ts contract (same request/response shape,
+// genuinely async response) without needing an actual OS thread.
+// ---------------------------------------------------------------------------
+
+class FakeTerrainWorker {
+  onmessage: ((e: { data: unknown }) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  constructor(_url: unknown, _opts?: unknown) {}
+
+  postMessage(message: ChunkBuildRequest & { requestId: number }): void {
+    // Genuinely asynchronous (a real worker's response can't arrive in the same microtask the
+    // request was sent in) — using the real buildChunkData() means this fake is exercising the
+    // exact same computation terrain.worker.ts wraps, just without crossing a real thread.
+    queueMicrotask(() => {
+      const { requestId, ...req } = message;
+      const result = buildChunkData(req);
+      this.onmessage?.({ data: { requestId, ...result } });
+    });
+  }
+
+  terminate(): void {}
+}
+
+describe("TerrainSystem — worker offload", () => {
+  const flushMicrotasks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("TerrainWorkerClient.active is false when no Worker global is available (e.g. this test environment)", () => {
+    const client = new TerrainWorkerClient();
+    expect(client.active).toBe(false);
+  });
+
+  it("loads chunks asynchronously through a fake Worker and finalizes them once it responds", async () => {
+    const originalWorker = (globalThis as any).Worker;
+    (globalThis as any).Worker = FakeTerrainWorker;
+
+    try {
+      const client = new TerrainWorkerClient();
+      expect(client.active).toBe(true);
+
+      const ts = new TerrainSystem(
+        { chunkSize: 8, resolution: 5, noise: { seed: 7 }, colliders: false, streamRadius: 5, maxChunkLoadsPerFrame: 4 },
+        client
+      );
+      ts.setScene(new THREE.Scene());
+      ts.init();
+      ts.setCameraPosition(0, 0);
+
+      ts.update(0.016);
+      // The worker request is in flight but hasn't resolved yet — nothing should be in the
+      // scene/chunk table synchronously, unlike the inline fallback path.
+      expect(ts.getChunkCount()).toBe(0);
+
+      await flushMicrotasks();
+
+      expect(ts.getChunkCount()).toBeGreaterThan(0);
+      const hm = (ts as any).chunkHeightmaps[0] as Float32Array | null;
+      expect(hm).not.toBeNull();
+      expect(hm!.length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as any).Worker = originalWorker;
+    }
+  });
+
+  it("discards a worker response for a chunk that's no longer wanted once it arrives", async () => {
+    const originalWorker = (globalThis as any).Worker;
+    (globalThis as any).Worker = FakeTerrainWorker;
+
+    try {
+      const client = new TerrainWorkerClient();
+      const ts = new TerrainSystem(
+        { chunkSize: 8, resolution: 5, noise: { seed: 7 }, colliders: false, streamRadius: 5, maxChunkLoadsPerFrame: 4 },
+        client
+      );
+      ts.setScene(new THREE.Scene());
+      ts.init();
+      ts.setCameraPosition(0, 0);
+      ts.update(0.016); // dispatches a build for the chunk under the camera, still in flight
+
+      // Camera jumps far away before the worker responds — the in-flight chunk is no longer
+      // anywhere near `needed` once update() recomputes it.
+      ts.setCameraPosition(10_000, 10_000);
+      ts.update(0.016);
+
+      await flushMicrotasks();
+
+      // The original (0,0) chunk's build did resolve, but onChunkBuilt() should have discarded
+      // it (no longer in wantedChunks once the camera moved) rather than loading a chunk
+      // nobody's near anymore. (Chunks near the new camera position are expected to load.)
+      const coordToSlot = (ts as any).coordToSlot as Map<string, number>;
+      expect(coordToSlot.has("0,0")).toBe(false);
+    } finally {
+      (globalThis as any).Worker = originalWorker;
+    }
   });
 });
 

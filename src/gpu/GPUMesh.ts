@@ -156,9 +156,9 @@ export class GPUMesh {
   }
 
   destroy(): void {
-    // AUDIT FIX (bug #3): fence before releasing buffers that in-flight command
-    // buffers may still reference — see GPUContext.resize() for the same pattern.
-    void this.device.queue.onSubmittedWorkDone();
+    // No fence needed before releasing these buffers — see GPUContext.resize() for why an
+    // unawaited onSubmittedWorkDone() fence here would have been a no-op anyway, and why
+    // destroy() is already spec-safe against in-flight command buffers that reference them.
     this.vertexBuffer.destroy();
     this.indexBuffer?.destroy();
   }

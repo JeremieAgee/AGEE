@@ -220,6 +220,62 @@ describe("SaveSystem (real save/load round trip)", () => {
     expect(result.success).toBe(false);
     expect(result.error).toBeTruthy();
   });
+
+  // The save wrapper's own `version` field (independent of SceneSerializer's scene-format
+  // version) — guards against a save written by a newer build being silently misread by an
+  // older one instead of cleanly rejected.
+  it("load() rejects a save whose wrapper version is newer than this build supports", () => {
+    const serializer = makeSerializer();
+    const save = new SaveSystem(serializer, "test_save_");
+    localStorage.setItem(
+      "test_save_future",
+      JSON.stringify({
+        version: 999,
+        scene: { version: 1, name: "future", entities: [{ id: 0, components: {} }] },
+        slot: { name: "future", timestamp: Date.now(), metadata: {} },
+      })
+    );
+
+    const world = new World();
+    const result = save.load(world, "future");
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/newer format/i);
+  });
+
+  it("load() still accepts a save with no wrapper version field, treating it as version 0", () => {
+    const serializer = makeSerializer();
+    const save = new SaveSystem(serializer, "test_save_");
+    localStorage.setItem(
+      "test_save_legacy",
+      JSON.stringify({
+        // No `version` field at all — as written by a build that predates it.
+        scene: { version: 1, name: "legacy", entities: [{ id: 0, components: {} }] },
+        slot: { name: "legacy", timestamp: Date.now(), metadata: {} },
+      })
+    );
+
+    const world = new World();
+    const result = save.load(world, "legacy");
+
+    expect(result.success).toBe(true);
+  });
+
+  it("importSave() rejects an import file whose wrapper version is newer than this build supports", async () => {
+    const serializer = makeSerializer();
+    const save = new SaveSystem(serializer, "test_save_");
+    const text = JSON.stringify({
+      version: 999,
+      scene: { version: 1, name: "future", entities: [{ id: 0, components: {} }] },
+      slot: { name: "future", timestamp: Date.now(), metadata: {} },
+    });
+    const file = new File([text], "future.json", { type: "application/json" });
+
+    const result = await save.importSave(file);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/newer save format/i);
+  });
 });
 
 // ---------------------------------------------------------------------------

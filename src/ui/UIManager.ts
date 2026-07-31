@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { System, World, ComponentStore } from "../ecs";
 import { Transform } from "../core/Components";
-import { Widget, Panel } from "./Widget";
+import { Widget, Panel, resolveUIOverlay } from "./Widget";
 import { defineComponent } from "../ecs";
 
 export const WorldUI = defineComponent("WorldUI", {
@@ -11,6 +11,11 @@ export const WorldUI = defineComponent("WorldUI", {
   billboard: "bool",
 });
 
+// UIManager/Widget is a standalone retained-mode widget tree (Panel/Label/Button/...); it does
+// not share state, z-order, or overlay lifecycle with UISystem's separate raw-HTML-string
+// widget map. Engine only instantiates UISystem by default — using both in the same scene
+// means two independent DOM overlays, not one composed UI. Pick one per project rather than
+// mixing them.
 export class UIManager extends System {
   priority = 840;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "render";
@@ -26,7 +31,7 @@ export class UIManager extends System {
 
   constructor(overlayId: string = "ui-overlay") {
     super();
-    this.overlay = document.getElementById(overlayId) ?? document.body;
+    this.overlay = resolveUIOverlay(overlayId);
     this.root = new Panel("root", {
       width: "100%",
       height: "100%",
@@ -64,6 +69,11 @@ export class UIManager extends System {
     return this.widgets.get(id);
   }
 
+  /**
+   * `html` is inserted via innerHTML as-is. Any untrusted content interpolated into it (player
+   * names, chat text, etc.) must be run through `escapeHtml()` from `./Widget` first, or this
+   * is an XSS vector.
+   */
   createWorldUI(eid: number, html: string, offsetY: number = 1.5, maxDistance: number = 30): void {
     const el = document.createElement("div");
     el.innerHTML = html;

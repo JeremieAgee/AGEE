@@ -134,15 +134,33 @@ describe("AssetSystem.load (texture path, single owner)", () => {
     await expect(sys.loadByPath("nope.png")).rejects.toBeDefined();
   });
 
-  // Note: an AssetSystem.load() call against a GLTF-typed handle is intentionally NOT
-  // exercised here. AssetSystem.ts rejects it synchronously (Promise.reject(...) at
-  // AssetSystem.ts:65) but then chains `promise.finally(() => this.inflight.delete(handle))`
-  // without capturing the resulting (also-rejected) promise. That derived promise is
-  // unreachable from any caller, so Node reports it as a separate, un-catchable "unhandled
-  // rejection" regardless of how carefully the caller awaits/catches load()'s own return
-  // value — there is no way to observe or suppress it from a test. The GLTF-rejection
-  // behavior itself is still exercised indirectly by GLTFPipeline.load() below, which is
-  // the intended call path for GLTF assets.
+  // AUDIT (fixed): this used to be untestable. load() rejects the GLTF-type branch
+  // synchronously (Promise.reject(...) above) and then chained
+  // `promise.finally(() => this.inflight.delete(handle))` — the *return value* of that
+  // .finally() call is a second, derived promise that also rejects, and since nothing kept a
+  // reference to it or attached a catch handler, it surfaced as an extra, uncatchable
+  // "unhandled rejection" no matter how carefully a caller awaited/caught load()'s own return
+  // value. Fixed by cleaning up via `.then(cleanup, cleanup)` instead, whose derived promise
+  // always resolves. This test would have failed the suite via an unhandled rejection before
+  // that fix, however carefully the returned promise itself was caught below.
+  it("load() against a GLTF-typed handle rejects without an unhandled promise rejection", async () => {
+    const sys = new AssetSystem();
+    const handle = sys.registerGLTF("gltf1", "scenes/model.gltf");
+
+    let sawUnhandledRejection = false;
+    const onUnhandled = () => { sawUnhandledRejection = true; };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      await expect(sys.load(handle)).rejects.toThrow(/GLTFPipeline\.load/);
+      // Let any microtask-queued unhandled-rejection reporting (Node reports these on a
+      // subsequent tick, not synchronously at reject time) actually surface before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sawUnhandledRejection).toBe(false);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
 
   it("release() disposes the resource and removes it from the store once refcount hits zero", async () => {
     const sys = new AssetSystem();
@@ -236,5 +254,77 @@ describe("GLTFPipeline.load (minimal inline glTF fixture)", () => {
     expect(gltfHandle).not.toBe(INVALID_ASSET);
     expect(assets.store.isLoaded(gltfHandle)).toBe(true);
     expect(assets.store.getRefCount(gltfHandle)).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GLTFPipeline.load — AUDIT: repeated/concurrent load() calls for the same id used to
+// re-run the whole parse+register pass, duplicating dependency entries and leaking the
+// previously-parsed geometry/material data (overwritten with no dispose). Fixed by giving
+// GLTFPipeline.load() the same cache-hit/inflight dedup AssetSystem.load() already has.
+// ---------------------------------------------------------------------------
+
+describe("GLTFPipeline.load — shared asset dependency accounting", () => {
+  let loadSpy: ReturnType<typeof vi.spyOn>;
+
+  function fakeGLTF() {
+    const scene = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshStandardMaterial());
+    mesh.name = "box";
+    scene.add(mesh);
+    return { scene, animations: [] };
+  }
+
+  beforeEach(() => {
+    // Bypasses real GLTF JSON parsing entirely (already covered above) so each call
+    // deterministically hands back a fresh scene graph with one mesh + one material.
+    loadSpy = vi.spyOn(GLTFLoader.prototype, "load").mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      function (this: any, _url: string, onLoad: any) {
+        onLoad(fakeGLTF());
+      }
+    );
+  });
+
+  afterEach(() => {
+    loadSpy.mockRestore();
+  });
+
+  it("sequential load() calls for the same id retain once per caller without duplicating dependencies", async () => {
+    const assets = new AssetSystem();
+    const pipeline = new GLTFPipeline(assets);
+
+    await pipeline.load("shared", "shared.gltf");
+    await pipeline.load("shared", "shared.gltf");
+
+    expect(loadSpy).toHaveBeenCalledTimes(1);
+
+    const gltfHandle = assets.store.getHandleById("shared");
+    expect(assets.store.getRefCount(gltfHandle)).toBe(2);
+    // One mesh + one material dependency — not four, which is what re-running
+    // loadAndRegister() a second time used to produce.
+    expect(assets.store.getDependencies(gltfHandle).length).toBe(2);
+
+    assets.release(gltfHandle);
+    expect(assets.isReady(gltfHandle)).toBe(true); // owner A still holds a reference
+
+    assets.release(gltfHandle);
+    expect(assets.store.getHandleById("shared")).toBe(INVALID_ASSET); // fully disposed
+  });
+
+  it("concurrent load() calls for the same id share one in-flight parse and both retain", async () => {
+    const assets = new AssetSystem();
+    const pipeline = new GLTFPipeline(assets);
+
+    const p1 = pipeline.load("shared2", "shared2.gltf");
+    const p2 = pipeline.load("shared2", "shared2.gltf");
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(r1).toBe(r2);
+    expect(loadSpy).toHaveBeenCalledTimes(1);
+
+    const gltfHandle = assets.store.getHandleById("shared2");
+    expect(assets.store.getRefCount(gltfHandle)).toBe(2);
+    expect(assets.store.getDependencies(gltfHandle).length).toBe(2);
   });
 });

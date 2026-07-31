@@ -1,36 +1,38 @@
-export class BinaryHeap {
-  private heap: Int32Array;
-  private scores: Float32Array;
+import { MinHeap } from "../core/BinaryHeap";
+
+// Specializes the shared MinHeap for A* over a bounded integer node-ID space (grid cell
+// indices): adds an O(1) positions lookup so the pathfinder can ask "is this cell already
+// queued?" (contains) and re-prioritize one already in the heap (decreaseKey) without a linear
+// scan. Sized to a fixed capacity and reused across every findPath() call by NavigationSystem
+// instead of being reallocated per call.
+export class BinaryHeap extends MinHeap<number> {
   private positions: Int32Array;
-  private size = 0;
 
   constructor(capacity: number) {
-    this.heap = new Int32Array(capacity);
-    this.scores = new Float32Array(capacity);
+    super();
     this.positions = new Int32Array(capacity).fill(-1);
   }
 
-  get length(): number { return this.size; }
-
-  push(value: number, score: number): void {
-    const idx = this.size;
-    this.heap[idx] = value;
-    this.scores[idx] = score;
+  override push(value: number, score: number): void {
+    const idx = this.values.length;
+    this.values.push(value);
+    this.scores.push(score);
     this.positions[value] = idx;
-    this.size++;
     this.bubbleUp(idx);
   }
 
-  pop(): number {
-    if (this.size === 0) return -1;
-    const result = this.heap[0];
+  override pop(): number {
+    const values = this.values, scores = this.scores;
+    if (values.length === 0) return -1;
+    const result = values[0];
     this.positions[result] = -1;
-    this.size--;
 
-    if (this.size > 0) {
-      this.heap[0] = this.heap[this.size];
-      this.scores[0] = this.scores[this.size];
-      this.positions[this.heap[0]] = 0;
+    const lastValue = values.pop() as number;
+    const lastScore = scores.pop() as number;
+    if (values.length > 0) {
+      values[0] = lastValue;
+      scores[0] = lastScore;
+      this.positions[lastValue] = 0;
       this.sinkDown(0);
     }
 
@@ -48,53 +50,14 @@ export class BinaryHeap {
     this.bubbleUp(idx);
   }
 
-  clear(): void {
-    for (let i = 0; i < this.size; i++) {
-      this.positions[this.heap[i]] = -1;
+  override clear(): void {
+    for (let i = 0; i < this.values.length; i++) {
+      this.positions[this.values[i]] = -1;
     }
-    this.size = 0;
+    super.clear();
   }
 
-  private bubbleUp(idx: number): void {
-    while (idx > 0) {
-      const parent = (idx - 1) >> 1;
-      if (this.scores[idx] >= this.scores[parent]) break;
-
-      this.swap(idx, parent);
-      idx = parent;
-    }
-  }
-
-  private sinkDown(idx: number): void {
-    while (true) {
-      const left = 2 * idx + 1;
-      const right = 2 * idx + 2;
-      let smallest = idx;
-
-      if (left < this.size && this.scores[left] < this.scores[smallest]) {
-        smallest = left;
-      }
-      if (right < this.size && this.scores[right] < this.scores[smallest]) {
-        smallest = right;
-      }
-
-      if (smallest === idx) break;
-      this.swap(idx, smallest);
-      idx = smallest;
-    }
-  }
-
-  private swap(a: number, b: number): void {
-    const tmpVal = this.heap[a];
-    const tmpScore = this.scores[a];
-
-    this.heap[a] = this.heap[b];
-    this.scores[a] = this.scores[b];
-
-    this.heap[b] = tmpVal;
-    this.scores[b] = tmpScore;
-
-    this.positions[this.heap[a]] = a;
-    this.positions[this.heap[b]] = b;
+  protected override onSwap(idx: number): void {
+    this.positions[this.values[idx]] = idx;
   }
 }

@@ -1,4 +1,4 @@
-import { ConnectionState } from "../NetworkTypes";
+import { ConnectionState, NETWORK_CONSTANTS } from "../NetworkTypes";
 import { Transport, TransportEvent } from "./Transport";
 
 export class WebSocketTransport implements Transport {
@@ -25,6 +25,14 @@ export class WebSocketTransport implements Transport {
 
     this.ws.onmessage = (ev: MessageEvent) => {
       if (ev.data instanceof ArrayBuffer) {
+        // Reject oversized messages before they're ever queued/parsed — without this, an
+        // arbitrarily large payload gets fully buffered and handed to BinaryReader regardless
+        // of legitimacy, letting a single hostile message force unbounded allocation.
+        if (ev.data.byteLength > NETWORK_CONSTANTS.MAX_MESSAGE_BYTES) {
+          console.warn(`[Network] Dropping oversized message (${ev.data.byteLength} bytes > ${NETWORK_CONSTANTS.MAX_MESSAGE_BYTES} limit); closing connection`);
+          this.ws?.close();
+          return;
+        }
         this.pendingEvents.push({ type: "message", data: ev.data });
       }
     };

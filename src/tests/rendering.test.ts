@@ -225,6 +225,27 @@ describe("CullingSystem: visibility decisions", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Regression test for the critical GLTF-invisibility bug: GLTFPipeline hands GPU-attached
+  // meshes to the native pipeline by setting MeshRenderer.skipThreeDraw=1 (not visible=0).
+  // CullingSystem must suppress only the THREE-side draw for those meshes, and must still
+  // drive GPUMeshRenderer.visible purely off frustum containment — otherwise every GLTF mesh
+  // routed to the WebGPU-native path never draws at all. See src/systems/CullingSystem.ts.
+  // -------------------------------------------------------------------------
+  it("an in-view GPU-attached mesh (skipThreeDraw=1) stays visible on GPUMeshRenderer while the THREE mesh stays hidden", () => {
+    const { world, eid, meshObj } = makeWorldWithMesh(0, 0, 0);
+    world.getStore(MeshRenderer).set(eid, "skipThreeDraw", 1);
+    const culling = new CullingSystem();
+    culling.world = world;
+    culling.init();
+    culling.setCamera(makeCamera());
+    culling.update(1 / 60);
+
+    expect(meshObj.visible).toBe(false);
+    expect(world.getStore(GPUMeshRenderer).get(eid, "visible")).toBe(1);
+    expect(culling.visibleCount).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
   // AUDIT BUG #1: CullingSystem computes correct frustum-culling visibility and
   // sets mesh.visible / GPUMeshRenderer.visible, but RenderSystem.update() runs
   // afterward (both are phase="render"; RenderSystem priority=900 > CullingSystem
@@ -770,55 +791,51 @@ describe("GPUContext: depth texture lifecycle", () => {
   });
 
   // -------------------------------------------------------------------------
-  // AUDIT BUG #3: resize() destroys the previous depth texture synchronously
-  // and destroy() destroys the device/depth texture synchronously, with no
-  // fence/wait against command buffers that might still be in flight and
-  // referencing them (e.g. via device.queue.onSubmittedWorkDone()). GPUMesh /
-  // GPUMaterialPool have the identical pattern for vertex/index/material
-  // buffers. This is the best proxy we can assert in a Node test without a
-  // real GPUDevice: the resource-safety *contract* (fence-before-destroy)
-  // simply isn't implemented. What we CANNOT verify here: actual driver-level
-  // use-after-free, timing/race conditions, or validation errors a real
-  // WebGPU implementation would raise — none of that is observable without a
-  // real GPU backend.
+  // AUDIT BUG #3 (fixed): resize()/destroy() previously called
+  // `void device.queue.onSubmittedWorkDone()` immediately before destroy(),
+  // as if that "fenced" the teardown. It didn't: nothing awaited the
+  // returned promise, so destroy() ran on the very next line regardless of
+  // whether any GPU work was still in flight — the call changed nothing.
+  // Per the WebGPU spec, destroy() is already safe against in-flight command
+  // buffers that reference the resource (the underlying resource stays alive
+  // at the implementation level until that work finishes), so no fence is
+  // needed at all. GPUMesh/GPUMaterialPool had the identical dead pattern for
+  // vertex/index/material buffers.
   // -------------------------------------------------------------------------
-  it("AUDIT: resize() should fence (e.g. await queue.onSubmittedWorkDone) before destroying the old depth texture — see src/gpu/GPUContext.ts:100", () => {
+  it("resize() destroys the previous depth texture without a no-op fence call", () => {
     const { ctx, device, callOrder } = makeCtx();
     ctx.resize(100, 100); // first depth texture, nothing to destroy yet
-    ctx.resize(200, 200); // destroys the first texture synchronously
+    ctx.resize(200, 200); // destroys the first texture
 
-    expect(device.queue.onSubmittedWorkDone).toHaveBeenCalled();
-    // If it were called, it should happen before the old texture is torn down.
-    const fenceIdx = callOrder.indexOf("queue.onSubmittedWorkDone");
-    const destroyIdx = callOrder.indexOf("texture.destroy");
-    expect(fenceIdx).toBeGreaterThanOrEqual(0);
-    expect(fenceIdx).toBeLessThan(destroyIdx);
+    expect(device.queue.onSubmittedWorkDone).not.toHaveBeenCalled();
+    expect(callOrder).toContain("texture.destroy");
   });
 
-  it("AUDIT: destroy() should fence before destroying the device/depth texture — see src/gpu/GPUContext.ts:129-138", () => {
+  it("destroy() destroys the depth texture/device without a no-op fence call", () => {
     const { ctx, device } = makeCtx();
     ctx.resize(64, 64);
     ctx.destroy();
-    expect(device.queue.onSubmittedWorkDone).toHaveBeenCalled();
+    expect(device.queue.onSubmittedWorkDone).not.toHaveBeenCalled();
   });
 });
 
-describe("Resource fencing on GPUMesh/GPUMaterialPool (AUDIT BUG #3, best-effort proxy)", () => {
-  it("AUDIT: GPUMesh.destroy() should fence before destroying its buffers — see src/gpu/GPUMesh.ts:153", () => {
+describe("GPUMesh/GPUMaterialPool resource teardown (AUDIT BUG #3, fixed)", () => {
+  it("GPUMesh.destroy() destroys its buffers without a no-op fence call", () => {
     const { device } = makeFakeDevice();
     const ctx: any = { device };
     const mesh = GPUMesh.create(ctx, { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]) });
     mesh.destroy();
-    expect(device.queue.onSubmittedWorkDone).toHaveBeenCalled();
+    expect(device.queue.onSubmittedWorkDone).not.toHaveBeenCalled();
+    expect(mesh.vertexBuffer.destroy).toHaveBeenCalled();
   });
 
-  it("AUDIT: GPUMaterialPool.free() should fence before destroying the material buffer — see src/gpu/GPUMaterialPool.ts:106", () => {
+  it("GPUMaterialPool.free() destroys the material buffer without a no-op fence call", () => {
     const { device } = makeFakeDevice();
     const ctx: any = { device };
     const pool = new GPUMaterialPool(ctx, {} as any);
     const h = pool.create({ r: 1, g: 1, b: 1 });
     pool.free(h);
-    expect(device.queue.onSubmittedWorkDone).toHaveBeenCalled();
+    expect(device.queue.onSubmittedWorkDone).not.toHaveBeenCalled();
   });
 });
 
@@ -1019,5 +1036,295 @@ describe("System ordering contract (AUDIT BUG #6)", () => {
     const renderSystemPriority = Number(match![1]);
 
     expect(gpuSys.priority).not.toBe(renderSystemPriority);
+  });
+});
+
+// ===========================================================================
+// LightSync: point/spot lights must reach the native GPU path, not just directional
+// ===========================================================================
+
+describe("LightSync: forwards point and spot lights, not just directional", () => {
+  it("forwards a point light via setPointLight and a spot light via setSpotLight, skips ambient", async () => {
+    const { LightSync } = await import("../gpu/LightSync");
+    const { Light } = await import("../core/Components");
+
+    const world = new World();
+
+    const pointEid = world.createEntity();
+    world.addComponent(pointEid, Transform, { x: 1, y: 2, z: 3, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(pointEid, Light, { lightType: 0, color: 0xff0000, intensity: 2, distance: 10, castShadow: 1 });
+
+    const spotEid = world.createEntity();
+    world.addComponent(spotEid, Transform, { x: 0, y: 5, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(spotEid, Light, { lightType: 2, color: 0x00ff00, intensity: 1, distance: 8, angle: 0.5, penumbra: 0.2 });
+
+    const ambientEid = world.createEntity();
+    world.addComponent(ambientEid, Transform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(ambientEid, Light, { lightType: 3, color: 0xffffff, intensity: 1 });
+
+    const fakeGpu = {
+      resetLights: vi.fn(),
+      setDirectionalLight: vi.fn(),
+      setPointLight: vi.fn(),
+      setSpotLight: vi.fn(),
+    };
+
+    const sync = new LightSync();
+    sync.sync(world, fakeGpu as any);
+
+    expect(fakeGpu.resetLights).toHaveBeenCalledOnce();
+    expect(fakeGpu.setPointLight).toHaveBeenCalledWith(1, 2, 3, 1, 0, 0, 2, 10, 1);
+    expect(fakeGpu.setSpotLight).toHaveBeenCalledOnce();
+    expect(fakeGpu.setDirectionalLight).not.toHaveBeenCalled();
+  });
+
+  it("forwards a directional light with direction pointed from its position toward the origin", async () => {
+    const { LightSync } = await import("../gpu/LightSync");
+    const { Light } = await import("../core/Components");
+
+    const world = new World();
+    const eid = world.createEntity();
+    // Positioned on the +X axis only, so the expected normalized direction toward the origin
+    // is simply (-1, 0, 0) — easy to assert exactly instead of just "was called".
+    world.addComponent(eid, Transform, { x: 10, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(eid, Light, { lightType: 1, color: 0x0000ff, intensity: 3 });
+
+    const fakeGpu = {
+      resetLights: vi.fn(),
+      setDirectionalLight: vi.fn(),
+      setPointLight: vi.fn(),
+      setSpotLight: vi.fn(),
+    };
+
+    new LightSync().sync(world, fakeGpu as any);
+
+    // Component-wise toBeCloseTo rather than toHaveBeenCalledWith: negating an f32-rounded 0
+    // produces -0, which Object.is (and therefore exact-equality matchers) treats as distinct
+    // from +0 even though it's numerically identical for this purpose.
+    expect(fakeGpu.setDirectionalLight).toHaveBeenCalledOnce();
+    const args = fakeGpu.setDirectionalLight.mock.calls[0];
+    const expected = [-1, 0, 0, 0, 0, 1, 3];
+    for (let i = 0; i < expected.length; i++) expect(args[i]).toBeCloseTo(expected[i]);
+    expect(fakeGpu.setPointLight).not.toHaveBeenCalled();
+    expect(fakeGpu.setSpotLight).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a straight-down direction for a directional/spot light positioned at the origin", async () => {
+    const { LightSync } = await import("../gpu/LightSync");
+    const { Light } = await import("../core/Components");
+
+    const world = new World();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(eid, Light, { lightType: 1, color: 0xffffff, intensity: 1 });
+
+    const fakeGpu = { resetLights: vi.fn(), setDirectionalLight: vi.fn(), setPointLight: vi.fn(), setSpotLight: vi.fn() };
+    new LightSync().sync(world, fakeGpu as any);
+
+    // Direction vector toward the origin from the origin is undefined (zero-length) — see
+    // LightSync's degenerate-case comment; it must not divide by ~zero and produce NaN/Infinity.
+    expect(fakeGpu.setDirectionalLight).toHaveBeenCalledWith(0, -1, 0, 1, 1, 1, 1);
+  });
+
+  it("computes exact spot light arguments: position, direction, color, and cone angles", async () => {
+    const { LightSync } = await import("../gpu/LightSync");
+    const { Light } = await import("../core/Components");
+
+    const world = new World();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 0, y: 10, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(eid, Light, {
+      lightType: 2, color: 0x00ff00, intensity: 1.5, distance: 8, angle: 0.5, penumbra: 0.2, castShadow: 1,
+    });
+
+    const fakeGpu = { resetLights: vi.fn(), setDirectionalLight: vi.fn(), setPointLight: vi.fn(), setSpotLight: vi.fn() };
+    new LightSync().sync(world, fakeGpu as any);
+
+    // `angle`/`penumbra` round-trip through an f32 SOA column, so the cosines LightSync
+    // computes from the read-back value differ from Math.cos(0.5) (a full double) by a tiny
+    // float32-rounding delta — compare with toBeCloseTo, not exact equality, for the same
+    // reason the direction components below do.
+    const outerCone = Math.cos(0.5);
+    const innerCone = Math.cos(0.5 * (1 - 0.2));
+    // Light sits on +Y only, so direction toward the origin is exactly (0, -1, 0).
+    const expected = [0, 10, 0, 0, -1, 0, 0, 1, 0, 1.5, 8, innerCone, outerCone, 1];
+    expect(fakeGpu.setSpotLight).toHaveBeenCalledOnce();
+    const args = fakeGpu.setSpotLight.mock.calls[0];
+    for (let i = 0; i < expected.length; i++) expect(args[i]).toBeCloseTo(expected[i], 4);
+  });
+
+  it("re-binds its query/stores when sync() is called against a different World", async () => {
+    const { LightSync } = await import("../gpu/LightSync");
+    const { Light } = await import("../core/Components");
+
+    const worldA = new World();
+    const eidA = worldA.createEntity();
+    worldA.addComponent(eidA, Transform, { x: 1, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldA.addComponent(eidA, Light, { lightType: 0, color: 0xffffff, intensity: 1, distance: 5 });
+
+    const worldB = new World();
+    const eidB = worldB.createEntity();
+    worldB.addComponent(eidB, Transform, { x: 2, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+    worldB.addComponent(eidB, Light, { lightType: 0, color: 0xffffff, intensity: 1, distance: 5 });
+
+    const sync = new LightSync();
+    const gpuA = { resetLights: vi.fn(), setDirectionalLight: vi.fn(), setPointLight: vi.fn(), setSpotLight: vi.fn() };
+    const gpuB = { resetLights: vi.fn(), setDirectionalLight: vi.fn(), setPointLight: vi.fn(), setSpotLight: vi.fn() };
+
+    sync.sync(worldA, gpuA as any);
+    sync.sync(worldB, gpuB as any);
+
+    // If the query/store cache didn't rebind for worldB, this would still report worldA's
+    // light (x=1) instead of worldB's (x=2), or throw entirely.
+    expect(gpuA.setPointLight).toHaveBeenCalledWith(1, 0, 0, 1, 1, 1, 1, 5, 0);
+    expect(gpuB.setPointLight).toHaveBeenCalledWith(2, 0, 0, 1, 1, 1, 1, 5, 0);
+  });
+});
+
+// ===========================================================================
+// LightingHelpers: THREE light + ECS Light/Transform component factory
+// ===========================================================================
+
+describe("LightingHelpers", () => {
+  async function makeHelpers() {
+    const { LightingHelpers } = await import("../lighting/LightingHelpers");
+    const { Light } = await import("../core/Components");
+    const world = new World();
+    const scene = new THREE.Scene();
+    return { helpers: new LightingHelpers(world, scene), world, scene, Light };
+  }
+
+  it("addAmbientLight adds a THREE.AmbientLight to the scene and an ambient Light component", async () => {
+    const { helpers, world, scene, Light } = await makeHelpers();
+    const eid = helpers.addAmbientLight(0x123456, 0.7);
+
+    expect(scene.children.some((c) => c instanceof THREE.AmbientLight)).toBe(true);
+    const store = world.getStore(Light);
+    expect(store.get(eid, "lightType")).toBe(3);
+    expect(store.get(eid, "color")).toBe(0x123456);
+    expect(store.get(eid, "intensity")).toBeCloseTo(0.7);
+  });
+
+  it("addDirectionalLight positions the THREE light and the Transform identically, and configures shadows only when requested", async () => {
+    const { helpers, world, scene, Light } = await makeHelpers();
+    const eid = helpers.addDirectionalLight(0xffffff, 2, { x: 3, y: 4, z: 5 }, true);
+
+    const threeLight = scene.children.find((c) => c instanceof THREE.DirectionalLight) as THREE.DirectionalLight;
+    expect(threeLight).toBeDefined();
+    expect(threeLight.position.x).toBe(3);
+    expect(threeLight.position.y).toBe(4);
+    expect(threeLight.position.z).toBe(5);
+    expect(threeLight.castShadow).toBe(true);
+
+    const transformStore = world.getStore(Transform);
+    expect(transformStore.get(eid, "x")).toBe(3);
+    expect(transformStore.get(eid, "y")).toBe(4);
+    expect(transformStore.get(eid, "z")).toBe(5);
+
+    const lightStore = world.getStore(Light);
+    expect(lightStore.get(eid, "lightType")).toBe(1);
+    expect(lightStore.get(eid, "castShadow")).toBe(1);
+
+    const eid2 = helpers.addDirectionalLight(0xffffff, 1, { x: 0, y: 1, z: 0 }, false);
+    const threeLight2 = scene.children.filter((c) => c instanceof THREE.DirectionalLight)[1] as THREE.DirectionalLight;
+    expect(threeLight2.castShadow).toBe(false);
+    expect(world.getStore(Light).get(eid2, "castShadow")).toBe(0);
+  });
+
+  it("addPointLight stores distance on both the THREE light and the Light component", async () => {
+    const { helpers, world, Light } = await makeHelpers();
+    const eid = helpers.addPointLight(0xff00ff, 1.2, 25, { x: 0, y: 3, z: 0 }, false);
+
+    const lightStore = world.getStore(Light);
+    expect(lightStore.get(eid, "lightType")).toBe(0);
+    expect(lightStore.get(eid, "distance")).toBe(25);
+    expect(lightStore.get(eid, "color")).toBe(0xff00ff);
+    expect(lightStore.get(eid, "intensity")).toBeCloseTo(1.2);
+  });
+
+  it("addSpotLight stores angle/penumbra and only sets shadow.normalBias when casting shadows", async () => {
+    const { helpers, world, scene, Light } = await makeHelpers();
+    const eid = helpers.addSpotLight(0xffffff, 1, 30, 0.4, 0.25, { x: 0, y: 10, z: 0 }, true);
+
+    const lightStore = world.getStore(Light);
+    expect(lightStore.get(eid, "lightType")).toBe(2);
+    expect(lightStore.get(eid, "angle")).toBeCloseTo(0.4);
+    expect(lightStore.get(eid, "penumbra")).toBeCloseTo(0.25);
+
+    const threeLight = scene.children.find((c) => c instanceof THREE.SpotLight) as THREE.SpotLight;
+    expect(threeLight.shadow.normalBias).toBe(0.05);
+  });
+});
+
+// ===========================================================================
+// GPURenderSystem: model/normal matrix cache must stay correct across frames
+// (an entity that moves must get a fresh matrix; the cache is keyed by eid,
+// not by draw slot, so it can't be pointed at a stale transform)
+// ===========================================================================
+
+describe("GPURenderSystem: per-entity matrix cache stays correct when a Transform changes", () => {
+  it("re-derives the model matrix after the entity's Transform changes between frames", () => {
+    const sys = new GPURenderSystem();
+    const { device, callOrder } = makeFakeDevice();
+    const beginFrame = vi.fn(() => ({ encoder: fakeEncoderForMatrixTest(), colorView: {} }));
+    const endFrame = vi.fn();
+    const gpuCtx: any = { device, canvas: { style: { display: "block" } }, depthView: {}, beginFrame, endFrame };
+
+    function fakeEncoderForMatrixTest() {
+      return {
+        beginRenderPass: vi.fn(() => ({
+          setPipeline: vi.fn(), setBindGroup: vi.fn(), setVertexBuffer: vi.fn(),
+          setIndexBuffer: vi.fn(), draw: vi.fn(), drawIndexed: vi.fn(), end: vi.fn(),
+        })),
+      };
+    }
+
+    const eid = 1;
+    const maxEid = eid + 1;
+    let posX = 0;
+    const tx = new Float32Array(maxEid);
+    const zeros = new Float32Array(maxEid);
+    const ones = new Float32Array(maxEid).fill(1);
+    const transformStore = {
+      getColumn: (name: string) => {
+        if (name === "x") return tx;
+        if (name === "sx" || name === "sy" || name === "sz") return ones;
+        return zeros;
+      },
+    };
+
+    const meshPool = new HandleMap<any>();
+    const meshHandle = meshPool.alloc({ vertexBuffer: {}, indexBuffer: null, vertexCount: 3, indexCount: 0, indexFormat: "uint16" });
+    const meshHandleArr = new Int32Array(maxEid); meshHandleArr[eid] = meshHandle as unknown as number;
+    const matHandleArr = new Int32Array(maxEid);
+    const visibleArr = new Uint8Array(maxEid); visibleArr[eid] = 1;
+    const meshRendererStore = {
+      getColumn: (name: string) => {
+        if (name === "meshHandle") return meshHandleArr;
+        if (name === "materialHandle") return matHandleArr;
+        if (name === "visible") return visibleArr;
+        return zeros;
+      },
+    };
+
+    const materialPool = new GPUMaterialPool(gpuCtx, {} as any);
+
+    Object.assign(sys as any, {
+      gpuCtx, meshPool, _materialPool: materialPool, transformStore, meshRendererStore,
+      query: { entities: [eid] }, pipeline: {}, cameraBuffer: {}, lightBuffer: {}, lightInfoBuffer: {},
+      modelBuffer: {}, modelData: new Float32Array(128), perFrameBindGroup: {}, perObjectBindGroup: {},
+    });
+
+    tx[eid] = 0;
+    sys.update(1 / 60);
+    const modelXAfterFirst = (sys as any).modelData[12]; // translation.x lives at elements[12] in a column-major 4x4
+
+    posX = 5;
+    tx[eid] = posX;
+    sys.update(1 / 60);
+    const modelXAfterMove = (sys as any).modelData[12];
+
+    expect(modelXAfterFirst).toBe(0);
+    expect(modelXAfterMove).toBe(5);
   });
 });

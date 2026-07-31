@@ -3,7 +3,7 @@ import { ComponentDef } from "../ecs/Component";
 import { Transform, Velocity } from "../core/Components";
 import { Transport } from "./transport/Transport";
 import { WebSocketTransport } from "./transport/WebSocketTransport";
-import { ComponentRegistry } from "./NetworkProtocol";
+import { ComponentRegistry, ActionRegistry } from "./NetworkProtocol";
 import { SnapshotManager } from "./SnapshotManager";
 import { InputBuffer } from "./InputBuffer";
 import { InterestManager } from "./InterestManager";
@@ -18,11 +18,17 @@ export interface NetworkConfig {
   relevanceRadius?: number;
   replicatedComponents?: ComponentDef[];
   transport?: Transport;
+  /** Input action names this game sends, registered once up front so Input messages can carry
+   *  a 1-byte index per action instead of resending the full name every client tick. Both the
+   *  client and server NetworkManager must register the same names in the same order (or just
+   *  pass the same array on both sides). */
+  actions?: string[];
 }
 
 export class NetworkManager {
   readonly role: NetworkRole;
   readonly registry: ComponentRegistry;
+  readonly actions: ActionRegistry;
   readonly snapshotManager: SnapshotManager;
   readonly inputBuffer: InputBuffer;
   readonly interestManager: InterestManager | null;
@@ -31,6 +37,14 @@ export class NetworkManager {
 
   private transport: Transport;
   private world: World;
+
+  // Server-mode auth hook: without this, addClient() accepted any transport handed to it with
+  // zero credential check — a raw ConnectAck with the next clientId, no validation at all. When
+  // set, addClient() rejects (disconnects, never registers) any client whose token fails this
+  // check instead of trusting the caller unconditionally. NetworkProtocol's writeConnect/
+  // readConnect carry the token over the wire; the host game's own connection-accept code is
+  // expected to read it off the first message on a new transport and pass it into addClient().
+  private authValidator: ((clientId: number, token: string) => boolean) | null = null;
 
   constructor(world: World, config: NetworkConfig) {
     this.world = world;
@@ -41,6 +55,11 @@ export class NetworkManager {
 
     if (config.replicatedComponents) {
       this.registry.register(...config.replicatedComponents);
+    }
+
+    this.actions = new ActionRegistry();
+    if (config.actions) {
+      this.actions.register(...config.actions);
     }
 
     this.snapshotManager = new SnapshotManager(world, this.registry);
@@ -61,6 +80,7 @@ export class NetworkManager {
       this.registry,
       this.inputBuffer,
       config.role,
+      this.actions,
     );
 
     this.sendSystem = new NetworkSendSystem();
@@ -70,6 +90,7 @@ export class NetworkManager {
       this.registry,
       this.inputBuffer,
       config.role,
+      this.actions,
     );
     this.sendSystem.tickRate = tickRate;
     this.sendSystem.setNetworkIdMap(this.receiveSystem.networkIdMap);
@@ -83,6 +104,12 @@ export class NetworkManager {
     } else {
       this.interestManager = null;
     }
+
+    // An ungraceful client disconnect (dropped connection, closed tab, etc.) only surfaced as
+    // a log line before — nothing removed the client from NetworkSendSystem's connectedClients
+    // map, so it kept getting sent snapshots on a dead transport forever. Route it through the
+    // same removeClient() path addClient()'s counterpart already uses.
+    this.receiveSystem.onClientDisconnected = (clientId) => this.removeClient(clientId);
   }
 
   init(): void {
@@ -111,6 +138,13 @@ export class NetworkManager {
     this.snapshotManager.registerReplicatedComponents(...defs);
   }
 
+  /** Registers additional input action names. Must be called identically (same names, same
+   *  order) on both the client and server NetworkManager before any Input messages using
+   *  them are sent — see NetworkConfig.actions for registering them all up front instead. */
+  registerAction(...names: string[]): void {
+    this.actions.register(...names);
+  }
+
   setInputCollector(collector: () => InputPayload): void {
     this.sendSystem.setInputCollector(collector);
   }
@@ -125,9 +159,27 @@ export class NetworkManager {
 
   // Server API
 
-  addClient(clientId: number, clientTransport: Transport): void {
+  /** Registers an auth check consulted by addClient() before a client is trusted. Return
+   *  true to accept the connection, false to reject it (the transport is disconnected and
+   *  never registered — no snapshots/inputs flow to or from it). */
+  setAuthValidator(fn: ((clientId: number, token: string) => boolean) | null): void {
+    this.authValidator = fn;
+  }
+
+  /** Registers a server-side client connection. Returns false (and disconnects the
+   *  transport without registering it anywhere) if an auth validator is configured and
+   *  rejects `token` — otherwise the client is accepted exactly as before. `token` defaults
+   *  to "" for callers that don't do wire-level auth (matches pre-existing behavior when no
+   *  validator is set). */
+  addClient(clientId: number, clientTransport: Transport, token: string = ""): boolean {
+    if (this.authValidator && !this.authValidator(clientId, token)) {
+      console.warn(`[Network] Rejecting client ${clientId}: auth validator declined the connection`);
+      clientTransport.disconnect();
+      return false;
+    }
     this.sendSystem.addClient(clientId, clientTransport);
     this.receiveSystem.addClientTransport(clientId, clientTransport);
+    return true;
   }
 
   removeClient(clientId: number): void {

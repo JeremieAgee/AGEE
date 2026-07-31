@@ -7,9 +7,6 @@ import { BitSet } from "../ecs/BitSet";
 import { SparseSet } from "../ecs/SparseSet";
 import { ArchetypeIndex } from "../ecs/ArchetypeIndex";
 import { Query } from "../ecs/Query";
-import { Chunk, CHUNK_SIZE } from "../ecs/Chunk";
-import { ChunkedArchetypeStorage } from "../ecs/ChunkedArchetype";
-import { ChunkedQuery } from "../ecs/ChunkedQuery";
 import { defineComponent } from "../ecs/Component";
 import { ComponentStore } from "../ecs/ComponentStore";
 import { CommandBuffer } from "../ecs/CommandBuffer";
@@ -705,152 +702,6 @@ describe("EventJournal", () => {
 });
 
 // ===========================================================================
-// ChunkedArchetype / Chunk / ChunkedQuery — standalone correctness
-// (bug #1: these are never wired into World; verified in a separate section below)
-// ===========================================================================
-describe("Chunk (standalone)", () => {
-  it("add/remove rows and reports full/empty state", () => {
-    const def = defineComponent("ChunkGapsA", { v: "f32" });
-    const chunk = new Chunk(1n, [def], 2);
-    expect(chunk.isEmpty).toBe(true);
-
-    const r0 = chunk.add(100);
-    const r1 = chunk.add(101);
-    expect(r0).toBe(0);
-    expect(r1).toBe(1);
-    expect(chunk.isFull).toBe(true);
-    expect(chunk.add(102)).toBe(-1); // over capacity
-
-    chunk.setComponentData("ChunkGapsA", r0, "v", 5);
-    chunk.setComponentData("ChunkGapsA", r1, "v", 9);
-    expect(chunk.getComponentData("ChunkGapsA", r0, "v")).toBe(5);
-    expect(chunk.getComponentData("ChunkGapsA", r1, "v")).toBe(9);
-  });
-
-  it("remove() swaps the last row into the removed slot", () => {
-    const def = defineComponent("ChunkGapsB", { v: "f32" });
-    const chunk = new Chunk(1n, [def], 4);
-    chunk.add(10); chunk.add(11); chunk.add(12);
-    chunk.setComponentData("ChunkGapsB", 0, "v", 100);
-    chunk.setComponentData("ChunkGapsB", 1, "v", 101);
-    chunk.setComponentData("ChunkGapsB", 2, "v", 102);
-
-    const result = chunk.remove(0); // remove entity 10 at row 0; last row (2, entity 12) swaps in
-    expect(result).toEqual({ swappedEntity: 12, swappedFrom: 2 });
-    expect(chunk.entityIds[0]).toBe(12);
-    expect(chunk.getComponentData("ChunkGapsB", 0, "v")).toBe(102);
-    expect(chunk.count).toBe(2);
-  });
-});
-
-describe("ChunkedArchetypeStorage / ChunkedQuery (standalone)", () => {
-  it("creates entities, adds components, and moves them across archetypes correctly", () => {
-    const Position = defineComponent("ChunkedGapsPos", { x: "f32", y: "f32" });
-    const Velocity = defineComponent("ChunkedGapsVel", { vx: "f32" });
-
-    const storage = new ChunkedArchetypeStorage();
-    storage.createEntity(1);
-    storage.addComponent(1, Position, { x: 10, y: 20 });
-    expect(storage.hasComponent(1, "ChunkedGapsPos")).toBe(true);
-    expect(storage.getComponentData(1, "ChunkedGapsPos", "x")).toBe(10);
-
-    // Adding a second component moves the entity to a new archetype; original data must survive.
-    storage.addComponent(1, Velocity, { vx: 5 });
-    expect(storage.hasComponent(1, "ChunkedGapsVel")).toBe(true);
-    expect(storage.getComponentData(1, "ChunkedGapsPos", "x")).toBe(10);
-    expect(storage.getComponentData(1, "ChunkedGapsPos", "y")).toBe(20);
-    expect(storage.getComponentData(1, "ChunkedGapsVel", "vx")).toBe(5);
-
-    // Removing a component moves it back down; remaining data must survive.
-    storage.removeComponent(1, Velocity);
-    expect(storage.hasComponent(1, "ChunkedGapsVel")).toBe(false);
-    expect(storage.getComponentData(1, "ChunkedGapsPos", "x")).toBe(10);
-  });
-
-  it("destroyEntity swaps the last entity in the chunk into the freed row", () => {
-    const Position = defineComponent("ChunkedGapsPos2", { x: "f32" });
-    const storage = new ChunkedArchetypeStorage();
-    storage.createEntity(1);
-    storage.createEntity(2);
-    storage.createEntity(3);
-    storage.addComponent(1, Position, { x: 1 });
-    storage.addComponent(2, Position, { x: 2 });
-    storage.addComponent(3, Position, { x: 3 });
-
-    storage.destroyEntity(1); // entity 3 (last) should swap into entity 1's old row
-    expect(storage.getComponentData(2, "ChunkedGapsPos2", "x")).toBe(2);
-    expect(storage.getComponentData(3, "ChunkedGapsPos2", "x")).toBe(3);
-    expect(storage.getEntityCount()).toBe(2);
-  });
-
-  it("allocates additional chunks once the current one is full", () => {
-    const Position = defineComponent("ChunkedGapsPos3", { x: "f32" });
-    const storage = new ChunkedArchetypeStorage();
-    // Use the default CHUNK_SIZE and fill past it to force a second chunk allocation.
-    for (let i = 0; i < CHUNK_SIZE + 5; i++) {
-      storage.createEntity(i);
-      storage.addComponent(i, Position, { x: i });
-    }
-    const bit = storage.getComponentBit("ChunkedGapsPos3");
-    const archetypes = storage.getMatchingArchetypes(bit);
-    expect(archetypes.length).toBe(1);
-    expect(archetypes[0].chunks.length).toBeGreaterThanOrEqual(2);
-    expect(storage.getComponentData(CHUNK_SIZE + 4, "ChunkedGapsPos3", "x")).toBe(CHUNK_SIZE + 4);
-  });
-
-  it("ChunkedQuery.forEachEntity/collectEntityIds visits exactly the matching entities and stays fresh after churn", () => {
-    const Position = defineComponent("ChunkedGapsQueryPos", { x: "f32" });
-    const Tag = defineComponent("ChunkedGapsQueryTag", {});
-    const storage = new ChunkedArchetypeStorage();
-    const posBit = storage.registerComponent(Position);
-
-    storage.createEntity(1);
-    storage.createEntity(2);
-    storage.addComponent(1, Position, { x: 1 });
-    storage.addComponent(2, Position, { x: 2 });
-
-    const query = new ChunkedQuery(storage, posBit, ["ChunkedGapsQueryPos"]);
-    expect(new Set(query.collectEntityIds())).toEqual(new Set([1, 2]));
-    expect(query.entityCount).toBe(2);
-
-    // Churn: add a third matching entity — the query's cache must pick it up (version bump).
-    storage.createEntity(3);
-    storage.addComponent(3, Position, { x: 3 });
-    expect(new Set(query.collectEntityIds())).toEqual(new Set([1, 2, 3]));
-
-    let visited = 0;
-    query.forEachEntity(() => { visited++; });
-    expect(visited).toBe(3);
-  });
-});
-
-describe("AUDIT (bug #1): ChunkedArchetype/ChunkedQuery are dead code, not World's real storage", () => {
-  it("World.getStore returns a ComponentStore, never touches ChunkedArchetypeStorage", () => {
-    const Comp = defineComponent("AuditChunkedWiring", { v: "f32" });
-    const world = new World();
-    const eid = world.createEntity();
-    world.addComponent(eid, Comp, { v: 1 });
-    const store = world.getStore(Comp);
-    expect(store.constructor.name).toBe("ComponentStore");
-  });
-
-  // AUDIT: ChunkedArchetype/Chunk/ChunkedQuery are correct in isolation (see the two describe
-  // blocks above), but World.ts, ComponentStore.ts, CommandBuffer.ts, and Query.ts never
-  // reference them anywhere — real component storage flows through ComponentStore's flat
-  // per-component typed arrays indexed by raw entity id. Only ChunkedArchetype.ts/ChunkedQuery.ts
-  // themselves and the barrel export in src/index.ts mention these classes; nothing in the
-  // actual ECS execution path (World/System/CommandBuffer) constructs or calls into a
-  // ChunkedArchetypeStorage or ChunkedQuery instance. See src/ecs/World.ts.
-  it("World/ComponentStore/CommandBuffer/Query source never reference the chunked storage classes", () => {
-    const files = ["ecs/World.ts", "ecs/ComponentStore.ts", "ecs/CommandBuffer.ts", "ecs/Query.ts"];
-    for (const rel of files) {
-      const src = readFileSync(resolve(srcRoot, rel), "utf-8");
-      expect(src).not.toMatch(/ChunkedArchetype|ChunkedQuery/);
-    }
-  });
-});
-
-// ===========================================================================
 // AUDIT (bug #6): ArchetypeIndex's global version counter
 // ===========================================================================
 describe("AUDIT (bug #6): ArchetypeIndex query-match cache uses one global version", () => {
@@ -926,6 +777,41 @@ describe("AUDIT (bug #2): HierarchyComponents Parent.entity is a raw, unguarded 
     // still holding the raw, now-recycled id, and the generation has moved on with no way for
     // a reader to detect that.
     expect(world.hasComponent(child, Parent)).toBe(false);
+  });
+
+  it("destroying one parent only cleans up its own children, leaving unrelated parents' children untouched (reverse-index correctness)", () => {
+    // World.cleanupDanglingParentRefs now looks children up via a childrenByParent reverse
+    // index instead of scanning every entity with a Parent component on every destroy —
+    // this exercises that the index stays correctly scoped per-parent across multiple
+    // independent hierarchies.
+    const world = new World();
+    const parentA = world.createEntity();
+    const parentB = world.createEntity();
+    const childA1 = world.createEntity();
+    const childA2 = world.createEntity();
+    const childB1 = world.createEntity();
+    world.addComponent(childA1, Parent, { entity: parentA });
+    world.addComponent(childA2, Parent, { entity: parentA });
+    world.addComponent(childB1, Parent, { entity: parentB });
+
+    world.destroyEntity(parentA);
+
+    expect(world.hasComponent(childA1, Parent)).toBe(false);
+    expect(world.hasComponent(childA2, Parent)).toBe(false);
+    expect(world.hasComponent(childB1, Parent)).toBe(true);
+    expect(world.getStore(Parent).get(childB1, "entity")).toBe(parentB);
+  });
+
+  it("removeComponent/hasComponent no-op consistently for a destroyed entity id, matching addComponent's existing isAlive guard", () => {
+    const Comp = defineComponent("AuditIsAliveConsistency", { v: "f32" });
+    const world = new World();
+    const eid = world.createEntity();
+    world.addComponent(eid, Comp, { v: 1 });
+    world.destroyEntity(eid);
+
+    expect(world.hasComponent(eid, Comp)).toBe(false);
+    expect(() => world.removeComponent(eid, Comp)).not.toThrow();
+    expect(world.hasComponent(eid, Comp)).toBe(false);
   });
 });
 

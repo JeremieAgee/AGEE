@@ -28,8 +28,10 @@ export class RenderSystem extends System {
   // GPURenderSystem (WebGPU-native) is the active opaque-geometry draw path. This system's
   // canvas renders transparent on top of it as a compositing overlay, so anything not yet
   // migrated to the native path (particles, world-space UI, debug wireframes) still shows up;
-  // meshes that GLTFPipeline has handed to the GPU path get MeshRenderer.visible=0 so they
-  // aren't drawn twice. `active` is a manual kill-switch for the overlay pass itself.
+  // meshes that GLTFPipeline has handed to the GPU path get MeshRenderer.skipThreeDraw=1 so
+  // CullingSystem forces mesh.visible=false for them without touching the shared `visible`
+  // flag GPUMeshRenderer visibility is computed from. `active` is a manual kill-switch for
+  // the overlay pass itself.
   active = true;
 
   constructor(canvas?: HTMLCanvasElement, backend: RenderBackend = "webgpu") {
@@ -122,6 +124,13 @@ export class RenderSystem extends System {
       if (!mesh) continue;
 
       mesh.position.set(tx[eid], ty[eid], tz[eid]);
+      // Transform's rx/ry/rz round-trip through Quat.toEuler()/fromEuler() (and the
+      // matching PhysicsSystem/DeterministicMath copies), which are all derived against
+      // THREE's 'ZYX' Euler order convention, not its default 'XYZ' — mesh.rotation defaults
+      // to 'XYZ', so without this the mesh would render a different orientation than the
+      // quaternion math (physics, skeleton FK, etc.) actually computed whenever more than
+      // one axis is non-zero.
+      mesh.rotation.order = "ZYX";
       mesh.rotation.set(trx[eid], trY[eid], trz[eid]);
       mesh.scale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
       // AUDIT FIX (bug #1): CullingSystem (priority 800) runs before this system

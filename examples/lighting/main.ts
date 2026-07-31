@@ -11,7 +11,7 @@ async function main(): Promise<void> {
 
   const lightStore = engine.world.getStore(Light);
 
-  const ambientEid = engine.lighting.addAmbientLight(0x223344, 0.35);
+  const ambientEid = engine.lighting.addAmbientLight(0x223344, 1.5);
   const dirEid = engine.lighting.addDirectionalLight(0xfff2d0, 1.2, { x: 8, y: 12, z: 6 }, true);
   const pointEid = engine.lighting.addPointLight(0xff5533, 2.5, 25, { x: -6, y: 3, z: 1 }, false);
   const spotEid = engine.lighting.addSpotLight(0x55aaff, 4, 30, Math.PI / 7, 0.4, { x: 0, y: 10, z: -3 }, true);
@@ -55,11 +55,11 @@ async function main(): Promise<void> {
   const hud = createHUD("Lighting", [
     "Drag to orbit, scroll to zoom",
     "Toggle each light on/off below",
-    "I = inspector, F3 = perf, ` = console",
+    "` = dev console (F3/I need EDITOR=true)",
   ]);
 
   const lights: Array<{ name: string; eid: number; intensity: number }> = [
-    { name: "Ambient", eid: ambientEid, intensity: 0.35 },
+    { name: "Ambient", eid: ambientEid, intensity: 1.5 },
     { name: "Directional (sun)", eid: dirEid, intensity: 1.2 },
     { name: "Point (red)", eid: pointEid, intensity: 2.5 },
     { name: "Spot (blue)", eid: spotEid, intensity: 4 },
@@ -86,6 +86,8 @@ async function main(): Promise<void> {
     row.appendChild(checkbox);
     hud.root.appendChild(row);
   }
+
+  engine.start();
 }
 
 main().catch((err) => {

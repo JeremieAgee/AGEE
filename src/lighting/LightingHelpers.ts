@@ -48,6 +48,12 @@ export class LightingHelpers {
       light.shadow.camera.right = 15;
       light.shadow.camera.top = 15;
       light.shadow.camera.bottom = -15;
+      // Without a bias, the depth comparison self-intersects the casting surface at
+      // shadow-map texel resolution, producing dense salt-and-pepper "shadow acne" across
+      // every lit face (worst on curved geometry). normalBias offsets the sampled point
+      // along the surface normal before the depth test, which clears acne on solid meshes
+      // without the peter-panning a depth-only bias would introduce at these camera bounds.
+      light.shadow.normalBias = 0.05;
     }
 
     this.scene.add(light);
@@ -111,6 +117,8 @@ export class LightingHelpers {
     const light = new THREE.SpotLight(color, intensity, distance, angle, penumbra);
     light.position.set(position.x, position.y, position.z);
     light.castShadow = castShadow;
+    // See addDirectionalLight's normalBias comment — same shadow-acne fix, same reason.
+    if (castShadow) light.shadow.normalBias = 0.05;
     this.scene.add(light);
 
     this.world.addComponent(eid, Transform, {

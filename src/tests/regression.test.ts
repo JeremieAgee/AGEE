@@ -17,6 +17,7 @@ import { SystemScheduler } from "../ecs/SystemScheduler";
 import { System } from "../ecs";
 import { EngineProfiler } from "../core/EngineProfiler";
 import { ValidationLayer } from "../core/ValidationLayer";
+import * as THREE from "three";
 
 function approx(a: number, b: number, eps = 1e-5): boolean {
   return Math.abs(a - b) < eps;
@@ -153,6 +154,35 @@ describe("Math", () => {
     m.decompose(oPos, oRot, oScale);
     expect(approx(oScale.x, 2) && approx(oScale.y, 3) && approx(oScale.z, 4)).toBe(true);
     expect(approx(oPos.x, 10) && approx(oPos.y, -5) && approx(oPos.z, 3)).toBe(true);
+    expect(approx(oRot.x, rot.x) && approx(oRot.y, rot.y) && approx(oRot.z, rot.z) && approx(oRot.w, rot.w)).toBe(true);
+  });
+
+  it("Quat.fromEuler/toEuler round-trips a multi-axis rotation", () => {
+    const original = new Quat(0.3, -0.2, 0.5, Math.sqrt(1 - 0.3 * 0.3 - 0.2 * 0.2 - 0.5 * 0.5));
+    const euler = original.toEuler();
+    const rebuilt = Quat.fromEuler(euler.x, euler.y, euler.z);
+    expect(approx(rebuilt.x, original.x) && approx(rebuilt.y, original.y)
+      && approx(rebuilt.z, original.z) && approx(rebuilt.w, original.w)).toBe(true);
+  });
+
+  // Transform.rx/ry/rz is produced by this engine's Quat<->Euler math, which composes in
+  // 'ZYX' order (see Quat.fromEuler/toEuler). THREE.Object3D.rotation defaults to 'XYZ', so
+  // any consumer that feeds those numbers into mesh.rotation.set() without first setting
+  // rotation.order = "ZYX" renders a different orientation than the engine actually computed
+  // for any rotation with more than one non-zero axis. RenderSystem/LODSystem set that order
+  // explicitly for exactly this reason.
+  it("engine Euler angles require THREE rotation.order = 'ZYX' to match Quat math", () => {
+    const rx = 0.3, ry = 0.6, rz = 0.9;
+    const engineQuat = Quat.fromEuler(rx, ry, rz);
+
+    const obj = new THREE.Object3D();
+    obj.rotation.order = "ZYX";
+    obj.rotation.set(rx, ry, rz);
+
+    expect(approx(obj.quaternion.x, engineQuat.x)).toBe(true);
+    expect(approx(obj.quaternion.y, engineQuat.y)).toBe(true);
+    expect(approx(obj.quaternion.z, engineQuat.z)).toBe(true);
+    expect(approx(obj.quaternion.w, engineQuat.w)).toBe(true);
   });
 
   it("Frustum.intersectsAABB returns boolean", () => {

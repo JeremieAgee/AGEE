@@ -98,6 +98,26 @@ export class GPURenderSystem extends System {
   private drawList: DrawCall[] = [];
   private _lightSync: LightSync | null = null;
 
+  // Per-entity model/normal matrix cache, keyed by eid. Recomputing a full 4x4 invert() plus a
+  // quaternion compose for every visible entity every frame (regardless of whether its Transform
+  // actually changed) was a real, avoidable per-frame CPU cost at scale — this skips the rebuild
+  // for any entity whose Transform is unchanged since last frame. The cached matrix is a pure
+  // function of the 9 transform values, so it stays correct even across entity-id recycling.
+  private matrixCacheCapacity = 0;
+  private cachedTx: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedTy: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedTz: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedRx: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedRy: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedRz: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedSx: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedSy: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedSz: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private cachedValid: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+  // 32 floats per eid: [0..16) = model matrix, [16..32) = normal matrix.
+  private cachedModelNormal: Float32Array<ArrayBuffer> = new Float32Array(0);
+  private drawCountWarned = false;
+
   setGPUContext(ctx: GPUContext): void {
     this.gpuCtx = ctx;
   }
@@ -205,14 +225,73 @@ export class GPURenderSystem extends System {
   // first instead of the count reflecting how many lights actually exist (the
   // storage buffer backing this supports up to MAX_LIGHTS=64). Now each call
   // appends into the next free slot and increments the count.
-  setDirectionalLight(dirX: number, dirY: number, dirZ: number, r: number, g: number, b: number, intensity: number): void {
+  //
+  // shaderType follows forward_opaque.wgsl's LightData.positionType.w convention
+  // (0=directional, 1=point, 2=spot) — distinct from, and not to be confused with,
+  // the ECS Light component's lightType convention (0=point, 1=directional, 2=spot,
+  // 3=ambient); LightSync is responsible for translating between the two.
+  private pushLight(
+    shaderType: 0 | 1 | 2,
+    px: number, py: number, pz: number,
+    dx: number, dy: number, dz: number,
+    r: number, g: number, b: number, intensity: number,
+    range: number, innerCone: number, outerCone: number, castShadow: number
+  ): void {
     if (this._lightCount >= MAX_LIGHTS) return;
     const base = this._lightCount * (LIGHT_STRIDE / 4);
-    this.lightData[base + 0] = 0; this.lightData[base + 1] = 0; this.lightData[base + 2] = 0; this.lightData[base + 3] = 0;
-    this.lightData[base + 4] = dirX; this.lightData[base + 5] = dirY; this.lightData[base + 6] = dirZ; this.lightData[base + 7] = 0;
+    this.lightData[base + 0] = px; this.lightData[base + 1] = py; this.lightData[base + 2] = pz; this.lightData[base + 3] = shaderType;
+    this.lightData[base + 4] = dx; this.lightData[base + 5] = dy; this.lightData[base + 6] = dz; this.lightData[base + 7] = range;
     this.lightData[base + 8] = r * intensity; this.lightData[base + 9] = g * intensity; this.lightData[base + 10] = b * intensity; this.lightData[base + 11] = intensity;
-    this.lightData[base + 12] = 0; this.lightData[base + 13] = 0; this.lightData[base + 14] = 0; this.lightData[base + 15] = 0;
+    this.lightData[base + 12] = innerCone; this.lightData[base + 13] = outerCone; this.lightData[base + 14] = castShadow; this.lightData[base + 15] = 0;
     this._lightCount++;
+  }
+
+  setDirectionalLight(dirX: number, dirY: number, dirZ: number, r: number, g: number, b: number, intensity: number): void {
+    this.pushLight(0, 0, 0, 0, dirX, dirY, dirZ, r, g, b, intensity, 0, 0, 0, 0);
+  }
+
+  setPointLight(px: number, py: number, pz: number, r: number, g: number, b: number, intensity: number, range: number, castShadow: number): void {
+    this.pushLight(1, px, py, pz, 0, 0, 0, r, g, b, intensity, range, 0, 0, castShadow);
+  }
+
+  private ensureMatrixCache(minCapacity: number): void {
+    if (minCapacity <= this.matrixCacheCapacity) return;
+    let cap = this.matrixCacheCapacity || 256;
+    while (cap < minCapacity) cap *= 2;
+
+    const growF32 = (old: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> => {
+      const fresh = new Float32Array(cap);
+      fresh.set(old);
+      return fresh;
+    };
+    this.cachedTx = growF32(this.cachedTx);
+    this.cachedTy = growF32(this.cachedTy);
+    this.cachedTz = growF32(this.cachedTz);
+    this.cachedRx = growF32(this.cachedRx);
+    this.cachedRy = growF32(this.cachedRy);
+    this.cachedRz = growF32(this.cachedRz);
+    this.cachedSx = growF32(this.cachedSx);
+    this.cachedSy = growF32(this.cachedSy);
+    this.cachedSz = growF32(this.cachedSz);
+
+    const freshValid = new Uint8Array(cap);
+    freshValid.set(this.cachedValid);
+    this.cachedValid = freshValid;
+
+    const freshModelNormal = new Float32Array(cap * 32);
+    freshModelNormal.set(this.cachedModelNormal);
+    this.cachedModelNormal = freshModelNormal;
+
+    this.matrixCacheCapacity = cap;
+  }
+
+  setSpotLight(
+    px: number, py: number, pz: number,
+    dirX: number, dirY: number, dirZ: number,
+    r: number, g: number, b: number, intensity: number,
+    range: number, innerCone: number, outerCone: number, castShadow: number
+  ): void {
+    this.pushLight(2, px, py, pz, dirX, dirY, dirZ, r, g, b, intensity, range, innerCone, outerCone, castShadow);
   }
 
   /** Clears the accumulated light count so a fresh per-frame sync (LightSync)
@@ -282,27 +361,55 @@ export class GPURenderSystem extends System {
       const mesh = this.meshPool.get(handle);
       if (!mesh) continue;
 
-      if (drawCount >= MAX_ENTITIES) break;
+      if (drawCount >= MAX_ENTITIES) {
+        if (!this.drawCountWarned) {
+          console.warn(`[AGEE] GPURenderSystem: visible entity count exceeds MAX_ENTITIES (${MAX_ENTITIES}); further entities are silently not drawn this frame.`);
+          this.drawCountWarned = true;
+        }
+        break;
+      }
 
-      this._pos.set(tx[eid], ty[eid], tz[eid]);
-      eulerToQuatInto(this._quat, trx[eid], trY[eid], trz[eid]);
-      this._scale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
+      this.ensureMatrixCache(eid + 1);
 
-      this._modelMat.compose(this._pos, this._quat, this._scale);
+      const px = tx[eid], py = ty[eid], pz = tz[eid];
+      const prx = trx[eid], pry = trY[eid], prz = trz[eid];
+      const psx = tsx[eid] || 1, psy = tsy[eid] || 1, psz = tsz[eid] || 1;
 
-      this._normalMat.copy(this._modelMat).invert();
-      const ne = this._normalMat.elements;
-      let tmp: number;
-      tmp = ne[1]; ne[1] = ne[4]; ne[4] = tmp;
-      tmp = ne[2]; ne[2] = ne[8]; ne[8] = tmp;
-      tmp = ne[3]; ne[3] = ne[12]; ne[12] = tmp;
-      tmp = ne[6]; ne[6] = ne[9]; ne[9] = tmp;
-      tmp = ne[7]; ne[7] = ne[13]; ne[13] = tmp;
-      tmp = ne[11]; ne[11] = ne[14]; ne[14] = tmp;
+      const cacheBase = eid * 32;
+      const dirty = this.cachedValid[eid] === 0
+        || this.cachedTx[eid] !== px || this.cachedTy[eid] !== py || this.cachedTz[eid] !== pz
+        || this.cachedRx[eid] !== prx || this.cachedRy[eid] !== pry || this.cachedRz[eid] !== prz
+        || this.cachedSx[eid] !== psx || this.cachedSy[eid] !== psy || this.cachedSz[eid] !== psz;
+
+      if (dirty) {
+        this._pos.set(px, py, pz);
+        eulerToQuatInto(this._quat, prx, pry, prz);
+        this._scale.set(psx, psy, psz);
+
+        this._modelMat.compose(this._pos, this._quat, this._scale);
+
+        this._normalMat.copy(this._modelMat).invert();
+        const ne = this._normalMat.elements;
+        let tmp: number;
+        tmp = ne[1]; ne[1] = ne[4]; ne[4] = tmp;
+        tmp = ne[2]; ne[2] = ne[8]; ne[8] = tmp;
+        tmp = ne[3]; ne[3] = ne[12]; ne[12] = tmp;
+        tmp = ne[6]; ne[6] = ne[9]; ne[9] = tmp;
+        tmp = ne[7]; ne[7] = ne[13]; ne[13] = tmp;
+        tmp = ne[11]; ne[11] = ne[14]; ne[14] = tmp;
+
+        this.cachedModelNormal.set(this._modelMat.elements, cacheBase);
+        this.cachedModelNormal.set(this._normalMat.elements, cacheBase + 16);
+
+        this.cachedTx[eid] = px; this.cachedTy[eid] = py; this.cachedTz[eid] = pz;
+        this.cachedRx[eid] = prx; this.cachedRy[eid] = pry; this.cachedRz[eid] = prz;
+        this.cachedSx[eid] = psx; this.cachedSy[eid] = psy; this.cachedSz[eid] = psz;
+        this.cachedValid[eid] = 1;
+      }
 
       const slotOffset = drawCount * floatsPerSlot;
-      this.modelData.set(this._modelMat.elements, slotOffset);
-      this.modelData.set(this._normalMat.elements, slotOffset + 16);
+      this.modelData.set(this.cachedModelNormal.subarray(cacheBase, cacheBase + 16), slotOffset);
+      this.modelData.set(this.cachedModelNormal.subarray(cacheBase + 16, cacheBase + 32), slotOffset + 16);
 
       const matHandle = matHandles[eid] as number as Handle;
       const materialBG = this._materialPool.getBindGroup(matHandle) ?? this._materialPool.defaultBindGroup;

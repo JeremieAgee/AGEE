@@ -68,6 +68,16 @@ export class SteeringSystem extends System {
   private flockHashBuilt = false;
   private flockCandidates: number[] = [];
 
+  // Fixed-timestep accumulator, matching PhysicsSystem's model: without this, steering
+  // integrated position/velocity directly against the variable per-frame dt, so identical
+  // elapsed wall-clock time produced different simulated results depending on how it was
+  // chopped into frames — breaking determinism for anything relying on it (multiplayer
+  // reconciliation, replays). Stepping in fixed FIXED_STEP increments makes the outcome only
+  // depend on total elapsed time, not frame timing.
+  private static readonly FIXED_STEP = 1 / 60;
+  private static readonly MAX_SUBSTEPS = 8;
+  private accumulator = 0;
+
   init(): void {
     this.steerStore = this.world.getStore(SteeringAgent);
     this.transformStore = this.world.getStore(Transform);
@@ -78,6 +88,16 @@ export class SteeringSystem extends System {
     const entities = this.query.entities;
     if (entities.length === 0) return;
 
+    this.accumulator += dt;
+    let steps = 0;
+    while (this.accumulator >= SteeringSystem.FIXED_STEP && steps < SteeringSystem.MAX_SUBSTEPS) {
+      this.stepOnce(entities, SteeringSystem.FIXED_STEP);
+      this.accumulator -= SteeringSystem.FIXED_STEP;
+      steps++;
+    }
+  }
+
+  private stepOnce(entities: number[], dt: number): void {
     this.flockHashBuilt = false;
 
     const tx = this.transformStore.getColumn("x");

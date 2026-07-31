@@ -408,54 +408,85 @@ export class SkeletonSystem extends System {
   private evaluateForwardKinematics(def: SkeletonDefinition, instance: SkeletonInstance): void {
     for (let i = 0; i < def.boneCount; i++) {
       if (def.parents[i] === -1) {
-        this.evaluateBoneFK(def, instance, i);
+        this.evaluateBoneFK(def, instance, i, false);
       }
     }
   }
 
-  private evaluateBoneFK(def: SkeletonDefinition, instance: SkeletonInstance, boneIndex: number): void {
-    const parentIdx = def.parents[boneIndex];
-    const localRot = new Quat(
-      instance.localRotX[boneIndex], instance.localRotY[boneIndex],
-      instance.localRotZ[boneIndex], instance.localRotW[boneIndex]
-    );
+  // parentDirty: true when the parent's world pose was just recomputed this call, which
+  // forces this bone's world pose to be recomputed too even if its own LOCAL flag is clean
+  // (its parent-relative pose didn't change, but its absolute world pose did).
+  private evaluateBoneFK(def: SkeletonDefinition, instance: SkeletonInstance, boneIndex: number, parentDirty: boolean): void {
+    const localDirty = instance.isDirty(boneIndex, DirtyFlags.LOCAL);
+    const dirty = localDirty || parentDirty;
 
-    if (parentIdx === -1) {
-      instance.worldPosX[boneIndex] = instance.localPosX[boneIndex];
-      instance.worldPosY[boneIndex] = instance.localPosY[boneIndex];
-      instance.worldPosZ[boneIndex] = instance.localPosZ[boneIndex];
-      instance.worldRotX[boneIndex] = localRot.x;
-      instance.worldRotY[boneIndex] = localRot.y;
-      instance.worldRotZ[boneIndex] = localRot.z;
-      instance.worldRotW[boneIndex] = localRot.w;
-    } else {
-      const parentRot = new Quat(
-        instance.worldRotX[parentIdx], instance.worldRotY[parentIdx],
-        instance.worldRotZ[parentIdx], instance.worldRotW[parentIdx]
-      );
-      const localPos = new Vec3(
-        instance.localPosX[boneIndex], instance.localPosY[boneIndex], instance.localPosZ[boneIndex]
-      );
-      const rotatedLocalPos = parentRot.rotateVec3(localPos);
-
-      instance.worldPosX[boneIndex] = instance.worldPosX[parentIdx] + rotatedLocalPos.x;
-      instance.worldPosY[boneIndex] = instance.worldPosY[parentIdx] + rotatedLocalPos.y;
-      instance.worldPosZ[boneIndex] = instance.worldPosZ[parentIdx] + rotatedLocalPos.z;
-
-      const worldRot = parentRot.clone().multiply(localRot);
-      instance.worldRotX[boneIndex] = worldRot.x;
-      instance.worldRotY[boneIndex] = worldRot.y;
-      instance.worldRotZ[boneIndex] = worldRot.z;
-      instance.worldRotW[boneIndex] = worldRot.w;
+    // Neither this bone nor its parent changed. If no descendant is independently dirty
+    // either (e.g. via setBoneLocalPose() on a bone further down the chain), the whole
+    // subtree's world poses are already current — skip recomputing (and even walking) it
+    // entirely. Mirrors TransformHierarchySystem's dirty-subtree skip for the same reason:
+    // this runs every frame for every non-ragdolled instance, and most skeletons are idle
+    // most of the time.
+    if (!dirty && !this.hasDirtyLocalDescendant(def, instance, boneIndex)) {
+      return;
     }
 
-    instance.dirtyFlags[boneIndex] &= ~(DirtyFlags.WORLD | DirtyFlags.LOCAL);
+    if (dirty) {
+      const parentIdx = def.parents[boneIndex];
+      const localRot = new Quat(
+        instance.localRotX[boneIndex], instance.localRotY[boneIndex],
+        instance.localRotZ[boneIndex], instance.localRotW[boneIndex]
+      );
+
+      if (parentIdx === -1) {
+        instance.worldPosX[boneIndex] = instance.localPosX[boneIndex];
+        instance.worldPosY[boneIndex] = instance.localPosY[boneIndex];
+        instance.worldPosZ[boneIndex] = instance.localPosZ[boneIndex];
+        instance.worldRotX[boneIndex] = localRot.x;
+        instance.worldRotY[boneIndex] = localRot.y;
+        instance.worldRotZ[boneIndex] = localRot.z;
+        instance.worldRotW[boneIndex] = localRot.w;
+      } else {
+        const parentRot = new Quat(
+          instance.worldRotX[parentIdx], instance.worldRotY[parentIdx],
+          instance.worldRotZ[parentIdx], instance.worldRotW[parentIdx]
+        );
+        const localPos = new Vec3(
+          instance.localPosX[boneIndex], instance.localPosY[boneIndex], instance.localPosZ[boneIndex]
+        );
+        const rotatedLocalPos = parentRot.rotateVec3(localPos);
+
+        instance.worldPosX[boneIndex] = instance.worldPosX[parentIdx] + rotatedLocalPos.x;
+        instance.worldPosY[boneIndex] = instance.worldPosY[parentIdx] + rotatedLocalPos.y;
+        instance.worldPosZ[boneIndex] = instance.worldPosZ[parentIdx] + rotatedLocalPos.z;
+
+        const worldRot = parentRot.clone().multiply(localRot);
+        instance.worldRotX[boneIndex] = worldRot.x;
+        instance.worldRotY[boneIndex] = worldRot.y;
+        instance.worldRotZ[boneIndex] = worldRot.z;
+        instance.worldRotW[boneIndex] = worldRot.w;
+      }
+
+      instance.dirtyFlags[boneIndex] &= ~(DirtyFlags.WORLD | DirtyFlags.LOCAL);
+    }
 
     let child = def.firstChild[boneIndex];
     while (child !== -1) {
-      this.evaluateBoneFK(def, instance, child);
+      this.evaluateBoneFK(def, instance, child, dirty);
       child = def.nextSibling[child];
     }
+  }
+
+  // Recursively checks whether any bone below (not including) boneIndex has a pending LOCAL
+  // change, so a clean-and-parent-clean ancestor knows whether it's still safe to skip the
+  // whole subtree instead of recomputing it.
+  private hasDirtyLocalDescendant(def: SkeletonDefinition, instance: SkeletonInstance, boneIndex: number): boolean {
+    let child = def.firstChild[boneIndex];
+    while (child !== -1) {
+      if (instance.isDirty(child, DirtyFlags.LOCAL)) return true;
+      if (this.hasDirtyLocalDescendant(def, instance, child)) return true;
+      child = def.nextSibling[child];
+    }
+    return false;
   }
 
   destroy(): void {

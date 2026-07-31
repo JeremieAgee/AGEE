@@ -53,6 +53,7 @@ export class CullingSystem extends System {
     const tz = this.transformStore.getColumn("z");
     const meshRefs = this.meshStore.getColumn("meshRef");
     const visibleCol = this.meshStore.getColumn("visible");
+    const skipThreeDrawCol = this.meshStore.getColumn("skipThreeDraw");
 
     this.totalCount = entities.length;
     let visible = 0;
@@ -106,7 +107,11 @@ export class CullingSystem extends System {
         inFrustum = this.frustum.containsPoint(point);
       }
 
-      mesh.visible = inFrustum;
+      // `visible` (checked above) is the single on/off switch shared by both draw paths.
+      // `skipThreeDraw` only suppresses the THREE.js-side draw for meshes that already have
+      // a GPU-native twin (see GLTFPipeline) — it must never affect GPUMeshRenderer visibility,
+      // or the GPU-native path would never draw anything it was handed.
+      mesh.visible = inFrustum && skipThreeDrawCol[eid] !== 1;
       this.setGPUVisible(eid, inFrustum);
       if (inFrustum) visible++;
     }

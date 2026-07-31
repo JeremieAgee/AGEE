@@ -698,12 +698,16 @@ export class PhysicsSystem extends System {
     this.controllers[eid] = controller;
   }
 
-  moveCharacter(eid: number, dx: number, dy: number, dz: number, dt: number): CharacterMoveResult {
+  // vx/vy/vz is a velocity in units/second, not a per-frame displacement — dt scales it into
+  // the actual movement passed to Rapier's shape-cast. Previously dt was accepted but never
+  // used, so the same (vx, vy, vz) call moved the character by the same absolute distance
+  // regardless of frame time, making movement speed framerate-dependent instead of constant.
+  moveCharacter(eid: number, vx: number, vy: number, vz: number, dt: number): CharacterMoveResult {
     const controller = this.controllers[eid];
     const collider = this.colliders[eid];
     if (!controller || !collider) return { grounded: false };
 
-    controller.computeColliderMovement(collider, { x: dx, y: dy, z: dz });
+    controller.computeColliderMovement(collider, { x: vx * dt, y: vy * dt, z: vz * dt });
 
     const movement = controller.computedMovement();
     const body = this.bodies[eid];

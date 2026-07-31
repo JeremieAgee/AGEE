@@ -66,6 +66,14 @@ export class BinaryWriter {
     return new Uint8Array(this.buffer, 0, this.offset);
   }
 
+  /** Rewinds the write cursor to the start so this writer can be reused for the next message
+   *  instead of allocating a fresh BinaryWriter (and its backing ArrayBuffer) per call. The
+   *  backing buffer's capacity is kept as-is (not shrunk), so it naturally settles at whatever
+   *  size the largest message written so far needed. */
+  reset(): void {
+    this.offset = 0;
+  }
+
   get size(): number { return this.offset; }
 }
 

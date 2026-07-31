@@ -37,20 +37,32 @@ All source lives under `src/`:
 - `src/assets/` — asset registration, loaders, GLTF pipeline
 - `src/audio/` — audio system and mixer
 - `src/animation/` — animation graph and runtime
+- `src/skeleton/` — skeletal animation, humanoid rigs, and ragdoll physics
 - `src/ai/` — AI subsystems and behavior frameworks
+- `src/navigation/` — pathfinding (grid A*) and navmesh queries
 - `src/network/` — networking, transports, snapshot manager, replication
 - `src/scene/` — scene manager and loading workflow
 - `src/prefab/` — prefab registration and instantiation
-- `src/terrain/` — procedural terrain and streaming chunks
+- `src/terrain/` — procedural terrain, streaming chunks, and off-main-thread chunk generation
 - `src/ui/` — UI manager and widget library
-- `src/tests/` — regression tests (no test runner is wired up to execute them yet — see Notes)
+- `src/input/` — keyboard, mouse, gamepad, and pointer-lock input
+- `src/gameplay/` — game state stack and save/load system
+- `src/tests/` — the test suite (see Getting Started)
+
+Runnable examples live under `examples/` (one subfolder per demo, each with its own
+`index.html` + `main.ts`); `examples/shared/` holds small helpers (HUD, orbit camera) reused
+across them.
 
 ## Getting Started
 
-This repository contains the source files for the engine only — there's no `package.json`,
-`tsconfig.json`, or bundler config checked in yet. To use AGEE, add your own TypeScript
-project configuration and package manifest (including `three` and `@dimforge/rapier3d-compat`
-as dependencies), then import the engine from `src/index.ts`.
+```sh
+npm install
+npm run dev        # starts the Vite dev server (serves index.html and every examples/*/index.html)
+npm run build      # production build (outputs to dist/)
+npm run typecheck  # tsc --noEmit
+npm run test       # runs the test suite once (vitest run)
+npm run test:watch # re-runs tests on change
+```
 
 Example usage:
 
@@ -71,10 +83,15 @@ engine.start();
   passed. That option only controls the Three.js overlay's backend — the native render
   pipeline always requests a WebGPU device on init and throws (failing `engine.init()`
   entirely) if `navigator.gpu` isn't available.
-- `src/tests/regression.test.ts` exists but no test runner (Jest/Vitest/etc.) is configured to
-  run it yet.
+- Terrain chunk generation offloads to a Web Worker (`src/terrain/terrain.worker.ts`) when the
+  `Worker` API is available, falling back to synchronous main-thread generation otherwise
+  (headless/Node, or a browser build that failed to start one).
 
 ## Contributing
 
-Contributions are welcome. Add missing configuration files (package manifest, tsconfig, a test
-runner) and example projects to make the engine easier to build, test, and run.
+Contributions are welcome — run `npm run typecheck` and `npm run test` before opening a PR
+(CI runs both on every push/PR via `.github/workflows/ci.yml`).
+
+## License
+
+[MIT](./LICENSE)

@@ -64,7 +64,7 @@ export class InputSystem extends System {
     this.element.addEventListener("mouseup", this.onMouseUp);
     this.element.addEventListener("mousemove", this.onMouseMove);
     this.element.addEventListener("wheel", this.onWheel, { passive: true });
-    this.element.addEventListener("contextmenu", (e) => e.preventDefault());
+    this.element.addEventListener("contextmenu", this.onContextMenu);
     document.addEventListener("pointerlockchange", this.onPointerLockChange);
   }
 
@@ -201,6 +201,10 @@ export class InputSystem extends System {
     this.mouse.wheel += e.deltaY;
   };
 
+  private onContextMenu = (e: Event): void => {
+    e.preventDefault();
+  };
+
   private onPointerLockChange = (): void => {
     this.mouse.locked = document.pointerLockElement === this.element;
   };
@@ -233,6 +237,8 @@ export class InputSystem extends System {
     this.element.removeEventListener("mousedown", this.onMouseDown);
     this.element.removeEventListener("mouseup", this.onMouseUp);
     this.element.removeEventListener("mousemove", this.onMouseMove);
+    this.element.removeEventListener("wheel", this.onWheel);
+    this.element.removeEventListener("contextmenu", this.onContextMenu);
     document.removeEventListener("pointerlockchange", this.onPointerLockChange);
   }
 }

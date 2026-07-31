@@ -6,6 +6,7 @@ import { FSMInstance } from "./FSM";
 import { UtilityInstance } from "./UtilityAI";
 import { GOAPInstance } from "./GOAP";
 import { Blackboard } from "./BehaviorTree";
+import { escapeHtml } from "../ui/Widget";
 
 interface AIDebugEntry {
   eid: number;
@@ -235,13 +236,13 @@ export class AIDebugPanel extends System {
     const state = fsm.definition.states.get(fsm.currentState);
     const transitions = state?.transitions.map(t => {
       const color = t.guard(entry.eid, fsm.blackboard) ? "#0f0" : "#666";
-      return `<span style="color:${color}">${t.to}</span>`;
+      return `<span style="color:${color}">${escapeHtml(t.to)}</span>`;
     }).join(", ") ?? "";
 
     return `<div style="margin-bottom:6px;">
-      <div style="color:#fa4;">FSM: ${fsm.definition.name}</div>
-      <div style="padding-left:8px;">state: <span style="color:#4f4;font-weight:bold">${fsm.currentState}</span> (${fsm.timeInState.toFixed(1)}s)</div>
-      <div style="padding-left:8px;">prev: ${fsm.previousState || "-"} | changes: ${fsm.stateChangeCount}</div>
+      <div style="color:#fa4;">FSM: ${escapeHtml(fsm.definition.name)}</div>
+      <div style="padding-left:8px;">state: <span style="color:#4f4;font-weight:bold">${escapeHtml(fsm.currentState)}</span> (${fsm.timeInState.toFixed(1)}s)</div>
+      <div style="padding-left:8px;">prev: ${escapeHtml(fsm.previousState || "-")} | changes: ${fsm.stateChangeCount}</div>
       <div style="padding-left:8px;">transitions: ${transitions || "none"}</div>
     </div>`;
   }
@@ -260,12 +261,12 @@ export class AIDebugPanel extends System {
       const bar = this.bar(score / maxScore, barColor);
       const cd = u.cooldowns.get(action.name);
       const cdStr = cd ? ` <span style="color:#f44">(cd:${cd.toFixed(1)}s)</span>` : "";
-      scoreRows += `<div style="padding-left:8px;color:${color}">${bar} ${action.name}: ${score.toFixed(3)}${cdStr}</div>`;
+      scoreRows += `<div style="padding-left:8px;color:${color}">${bar} ${escapeHtml(action.name)}: ${score.toFixed(3)}${cdStr}</div>`;
     }
 
     return `<div style="margin-bottom:6px;">
-      <div style="color:#fa4;">Utility: ${u.set.name}</div>
-      <div style="padding-left:8px;">active: <span style="color:#4f4;font-weight:bold">${u.currentAction}</span> (${u.actionTime.toFixed(1)}s)</div>
+      <div style="color:#fa4;">Utility: ${escapeHtml(u.set.name)}</div>
+      <div style="padding-left:8px;">active: <span style="color:#4f4;font-weight:bold">${escapeHtml(u.currentAction)}</span> (${u.actionTime.toFixed(1)}s)</div>
       ${scoreRows}
     </div>`;
   }
@@ -280,17 +281,17 @@ export class AIDebugPanel extends System {
       const done = i < g.planIndex;
       const color = isCurrent ? "#4f4" : done ? "#666" : "#aaa";
       const prefix = isCurrent ? ">" : done ? "v" : " ";
-      return `<div style="padding-left:16px;color:${color}">${prefix} ${a.name} (cost:${a.cost})</div>`;
+      return `<div style="padding-left:16px;color:${color}">${prefix} ${escapeHtml(a.name)} (cost:${a.cost})</div>`;
     }).join("");
 
     let stateRows = "";
     for (const [key, val] of g.worldState) {
-      stateRows += `<div style="padding-left:16px;color:#888">${key}: <span style="color:#8f8">${val}</span></div>`;
+      stateRows += `<div style="padding-left:16px;color:#888">${escapeHtml(key)}: <span style="color:#8f8">${val}</span></div>`;
     }
 
     return `<div style="margin-bottom:6px;">
       <div style="color:#fa4;">GOAP</div>
-      <div style="padding-left:8px;">goal: <span style="color:#ff4">${goalName}</span> | status: ${g.actionStatus}</div>
+      <div style="padding-left:8px;">goal: <span style="color:#ff4">${escapeHtml(goalName)}</span> | status: ${g.actionStatus}</div>
       <div style="padding-left:8px;">plan (${g.plan.length} steps):</div>
       ${planSteps || `<div style="padding-left:16px;color:#666">empty</div>`}
       <div style="padding-left:8px;">world state:</div>
@@ -309,10 +310,15 @@ export class AIDebugPanel extends System {
 
     for (const [key, val] of data) {
       if (skipKeys.has(key)) continue;
+      // Blackboard values are `any` and set at runtime by arbitrary AI/game code — unlike
+      // component fields (numeric/boolean only, see ComponentSchema) a blackboard entry can
+      // hold a plain string sourced from anywhere (chat text, a player display name, etc.).
+      // Escape before interpolating into innerHTML or a value like `<img src=x onerror=...>`
+      // renders as live markup in this panel.
       const display = typeof val === "number" ? val.toFixed(3) :
                       typeof val === "boolean" ? String(val) :
-                      typeof val === "string" ? val : JSON.stringify(val);
-      rows += `<div style="padding-left:8px;color:#888">${key}: <span style="color:#8f8">${display}</span></div>`;
+                      typeof val === "string" ? escapeHtml(val) : escapeHtml(JSON.stringify(val));
+      rows += `<div style="padding-left:8px;color:#888">${escapeHtml(key)}: <span style="color:#8f8">${display}</span></div>`;
     }
 
     if (!rows) return "";

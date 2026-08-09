@@ -6,7 +6,7 @@ import { AssetSystem } from "../assets/AssetSystem";
 import { AssetHandle } from "../assets/AssetTypes";
 
 // SOA mixer storage: flat arrays indexed by mixer slot
-const MAX_MIXERS = 512;
+const INITIAL_MIXER_CAPACITY = 512;
 const MAX_CLIPS_PER_MIXER = 16;
 
 export class AnimationSystem extends System {
@@ -21,10 +21,11 @@ export class AnimationSystem extends System {
   private assets!: AssetSystem;
 
   // SOA mixer pool — Three.js mixers behind slot indices, not Maps
-  private mixerObjects: (THREE.AnimationMixer | null)[] = new Array(MAX_MIXERS).fill(null);
-  private mixerEntityMap: Int32Array = new Int32Array(MAX_MIXERS).fill(-1);
-  private mixerClipNames: string[][] = new Array(MAX_MIXERS).fill(null).map(() => []);
-  private mixerActions: (THREE.AnimationAction | null)[][] = new Array(MAX_MIXERS).fill(null).map(() => []);
+  private mixerObjects: (THREE.AnimationMixer | null)[] = new Array(INITIAL_MIXER_CAPACITY).fill(null);
+  private mixerEntityMap: Int32Array = new Int32Array(INITIAL_MIXER_CAPACITY).fill(-1);
+  private mixerClipNames: string[][] = new Array(INITIAL_MIXER_CAPACITY).fill(null).map(() => []);
+  private mixerActions: (THREE.AnimationAction | null)[][] = new Array(INITIAL_MIXER_CAPACITY).fill(null).map(() => []);
+  private mixerCapacity = INITIAL_MIXER_CAPACITY;
   private mixerCount = 0;
   private mixerFree: number[] = [];
 
@@ -44,8 +45,30 @@ export class AnimationSystem extends System {
     });
   }
 
+  private allocMixerSlot(): number {
+    if (this.mixerCount >= this.mixerCapacity) this.growMixers();
+    return this.mixerCount++;
+  }
+
+  private growMixers(): void {
+    const newCapacity = this.mixerCapacity * 2;
+    const newEntityMap = new Int32Array(newCapacity).fill(-1);
+    newEntityMap.set(this.mixerEntityMap);
+    this.mixerEntityMap = newEntityMap;
+
+    this.mixerObjects.length = newCapacity;
+    this.mixerClipNames.length = newCapacity;
+    this.mixerActions.length = newCapacity;
+    for (let i = this.mixerCapacity; i < newCapacity; i++) {
+      this.mixerObjects[i] = null;
+      this.mixerClipNames[i] = [];
+      this.mixerActions[i] = [];
+    }
+    this.mixerCapacity = newCapacity;
+  }
+
   createMixer(eid: number, root: THREE.Object3D): number {
-    const slot = this.mixerFree.length > 0 ? this.mixerFree.pop()! : this.mixerCount++;
+    const slot = this.mixerFree.length > 0 ? this.mixerFree.pop()! : this.allocMixerSlot();
     const mixer = new THREE.AnimationMixer(root);
     this.mixerObjects[slot] = mixer;
     this.mixerEntityMap[slot] = eid;

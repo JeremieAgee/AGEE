@@ -29,11 +29,11 @@ import { LightingHelpers } from "../lighting/LightingHelpers";
 import { SkeletonSystem } from "../skeleton/SkeletonSystem";
 import { SceneSerializer } from "./serialization/SceneSerializer";
 import { SpatialHash } from "./spatial/SpatialHash";
-import { Transform, MeshRenderer, Light } from "./Components";
+import { Transform, MeshRenderer, Light, GPUMeshRenderer } from "./Components";
 import { GPUContext } from "../gpu/GPUContext";
 import { GPURenderSystem } from "../gpu/GPURenderSystem";
 import { GPUMesh } from "../gpu/GPUMesh";
-import { HandleMap } from "./handles/Handle";
+import { HandleMap, type Handle } from "./handles/Handle";
 import { NetworkManager } from "../network/NetworkManager";
 import type { NetworkConfig } from "../network/NetworkManager";
 import * as THREE from "three";
@@ -118,11 +118,13 @@ export class AGEE {
       trackRendering: true,
     });
 
+    this.assetSystem = new AssetSystem();
+
     if (config.memoryBudget) {
       this.resources.setMemoryBudget(config.memoryBudget);
+      this.assetSystem.memoryBudget.setTotalBudget(config.memoryBudget);
     }
 
-    this.assetSystem = new AssetSystem();
     this.physics = new PhysicsSystem();
     this.skeleton = new SkeletonSystem();
     this.transformHierarchy = new TransformHierarchySystem();
@@ -142,8 +144,10 @@ export class AGEE {
       (this as any).culling = new CullingSystem();
       (this as any).postProcess = new PostProcessSystem();
       (this as any).physicsDebug = new PhysicsDebugRenderer();
-      (this as any).debugOverlay = new DebugOverlay();
-      (this as any).devConsole = new DevConsole();
+      if (__EDITOR__) {
+        (this as any).debugOverlay = new DebugOverlay();
+        (this as any).devConsole = new DevConsole();
+      }
       (this as any).debugDraw = new DebugDraw();
       (this as any).gltfPipeline = new GLTFPipeline(this.assetSystem);
     }
@@ -236,8 +240,10 @@ export class AGEE {
         this.world.addSystem(this.webgpuOverlay);
         this.world.addSystem(this.postProcess);
         this.world.addSystem(this.ui);
-        this.world.addSystem(this.debugOverlay);
-        this.world.addSystem(this.devConsole);
+        if (__EDITOR__) {
+          this.world.addSystem(this.debugOverlay);
+          this.world.addSystem(this.devConsole);
+        }
         this.world.addSystem(this.debugDraw);
       });
 
@@ -248,7 +254,9 @@ export class AGEE {
         this.lighting = new LightingHelpers(this.world, this.render.scene);
         this.physicsDebug.setup(this.render.scene, this.physics);
         (this as any).mixer = new AudioMixer(this.audio.listener);
-        this.debugOverlay.setProfiler(this.profiler);
+        if (__EDITOR__) {
+          this.debugOverlay.setProfiler(this.profiler);
+        }
         this.debugDraw.setup(this.render.scene);
       });
 
@@ -331,6 +339,18 @@ export class AGEE {
           if (light.parent) light.parent.remove(light);
           light.dispose();
         }
+      }
+      // GLTFPipeline allocates a GPUMesh (vertex/index buffers) and a GPU material buffer
+      // per spawned instance (see createEntityFromObject) but had no matching release path —
+      // every despawn leaked both. free() returns the pooled resource so it can be destroyed;
+      // it doesn't destroy it itself, since not every HandleMap holds GPU resources.
+      const gpuMeshStore = this.world.getStore(GPUMeshRenderer);
+      if (gpuMeshStore.has(eid)) {
+        const meshHandle = gpuMeshStore.get(eid, "meshHandle") as number as Handle;
+        const materialHandle = gpuMeshStore.get(eid, "materialHandle") as number as Handle;
+        const mesh = this.gpuMeshPool.free(meshHandle);
+        mesh?.destroy();
+        this.gpuRender?.materialPool?.free(materialHandle);
       }
     });
 
@@ -429,6 +449,12 @@ export class AGEE {
 
 function disposeObject3D(obj: THREE.Object3D): void {
   obj.traverse((child) => {
+    // GLTFPipeline-instantiated meshes share geometry/material by reference across every clone
+    // of the same asset and flag themselves accordingly (see createEntityFromObject) — those
+    // are owned by the AssetSystem's retain/release cycle on the GLTF asset, not by this entity,
+    // so disposing them here would free GPU buffers any other live instance still draws from.
+    if (child.userData?.assetOwned) return;
+
     const mesh = child as THREE.Mesh;
     if (mesh.geometry) mesh.geometry.dispose();
     if (mesh.material) {

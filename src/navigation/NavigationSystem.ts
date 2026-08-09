@@ -1,6 +1,7 @@
 import { System, World, ComponentStore, defineComponent } from "../ecs";
 import { Transform } from "../core/Components";
 import { BinaryHeap } from "./BinaryHeap";
+import { dabs, dmax, dmin, dfloor, dsqrt, datan2 } from "../core/DeterministicMath";
 
 // SOA component — all nav data in typed arrays
 export const NavAgent = defineComponent("NavAgent", {
@@ -93,9 +94,9 @@ export class NavigationSystem extends System {
    *  steps cost sqrt(2) (see COSTS in findPath) — Manhattan distance overestimates on
    *  diagonal-heavy routes and isn't admissible for this movement model. */
   private static octile(dx: number, dz: number): number {
-    const adx = Math.abs(dx);
-    const adz = Math.abs(dz);
-    return Math.max(adx, adz) + (Math.SQRT2 - 1) * Math.min(adx, adz);
+    const adx = dabs(dx);
+    const adz = dabs(dz);
+    return dmax(adx, adz) + (Math.SQRT2 - 1) * dmin(adx, adz);
   }
 
   setWalkable(gridX: number, gridZ: number, walkable: boolean): void {
@@ -130,7 +131,7 @@ export class NavigationSystem extends System {
 
   private worldToGrid(wx: number, wz: number): { x: number; z: number } | null {
     if (!this.grid) return null;
-    return { x: Math.floor(wx / this.grid.cellSize), z: Math.floor(wz / this.grid.cellSize) };
+    return { x: dfloor(wx / this.grid.cellSize), z: dfloor(wz / this.grid.cellSize) };
   }
 
   findPath(fromX: number, fromZ: number, toX: number, toZ: number): number {
@@ -212,7 +213,7 @@ export class NavigationSystem extends System {
     // actually is would be unusable, whereas a path that falls short of the goal can simply
     // be replanned once the agent reaches the end of it.
     const fullLen = tempPath.length;
-    const pathLen = Math.min(fullLen, MAX_PATH_NODES);
+    const pathLen = dmin(fullLen, MAX_PATH_NODES);
 
     for (let i = 0; i < pathLen; i++) {
       const cell = tempPath[fullLen - 1 - i];
@@ -289,7 +290,7 @@ export class NavigationSystem extends System {
 
       const dx = wpX - px[eid];
       const dz = wpZ - pz[eid];
-      const dist = Math.sqrt(dx * dx + dz * dz);
+      const dist = dsqrt(dx * dx + dz * dz);
       const stopDist = stopDists[eid] || 0.5;
 
       if (dist < stopDist) {
@@ -304,12 +305,12 @@ export class NavigationSystem extends System {
       }
 
       const speed = speeds[eid];
-      const moveSpeed = Math.min(speed * dt, dist);
+      const moveSpeed = dmin(speed * dt, dist);
       const nx = dx / dist;
       const nz = dz / dist;
       px[eid] += nx * moveSpeed;
       pz[eid] += nz * moveSpeed;
-      ry[eid] = Math.atan2(nx, nz);
+      ry[eid] = datan2(nx, nz);
     }
   }
 }

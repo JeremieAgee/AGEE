@@ -70,6 +70,8 @@ function makeFakeDevice() {
   const device: any = {
     queue: {
       writeBuffer: vi.fn(),
+      writeTexture: vi.fn(),
+      copyExternalImageToTexture: vi.fn(),
       onSubmittedWorkDone: vi.fn(() => {
         callOrder.push("queue.onSubmittedWorkDone");
         return Promise.resolve();
@@ -88,6 +90,7 @@ function makeFakeDevice() {
       destroy: vi.fn(() => callOrder.push("texture.destroy")),
       createView: () => ({}),
     })),
+    createSampler: vi.fn((desc: any) => ({ __label: desc?.label })),
     createBindGroupLayout: vi.fn((desc: any) => ({ __label: desc.label, entries: desc.entries })),
     createBindGroup: vi.fn((desc: any) => ({ __label: desc.label, entries: desc.entries })),
     createPipelineLayout: vi.fn((desc: any) => ({ __label: desc.label })),
@@ -710,18 +713,22 @@ describe("HandleMap: generic pool used for GPUMesh handles (allocation/reuse/gen
 // BindGroupLayouts + ThreeGeometryAdapter: pure bookkeeping / pure conversion
 // ===========================================================================
 
-describe("BindGroupLayouts: creates the expected 3-group pipeline layout", () => {
-  it("calls createBindGroupLayout for each of the 3 groups and createPipelineLayout once", () => {
+describe("BindGroupLayouts: creates the expected forward + shadow pipeline layouts", () => {
+  it("calls createBindGroupLayout for each of the 4 groups and createPipelineLayout twice", () => {
     const { device } = makeFakeDevice();
     const ctx: any = { device };
     const layouts = createFrameLayouts(ctx);
 
-    expect(device.createBindGroupLayout).toHaveBeenCalledTimes(3);
-    expect(device.createPipelineLayout).toHaveBeenCalledTimes(1);
+    // perFrame, perMaterial, perObject, and shadowFrame (the shadow depth pass's light viewProj).
+    expect(device.createBindGroupLayout).toHaveBeenCalledTimes(4);
+    // The main forward pipeline layout and the shadow depth pipeline layout.
+    expect(device.createPipelineLayout).toHaveBeenCalledTimes(2);
     expect(layouts.perFrame).toBeDefined();
     expect(layouts.perMaterial).toBeDefined();
     expect(layouts.perObject).toBeDefined();
     expect(layouts.pipelineLayout).toBeDefined();
+    expect(layouts.shadowFrame).toBeDefined();
+    expect(layouts.shadowPipelineLayout).toBeDefined();
   });
 });
 
@@ -1123,7 +1130,8 @@ describe("LightSync: forwards point and spot lights, not just directional", () =
 
     // Direction vector toward the origin from the origin is undefined (zero-length) — see
     // LightSync's degenerate-case comment; it must not divide by ~zero and produce NaN/Infinity.
-    expect(fakeGpu.setDirectionalLight).toHaveBeenCalledWith(0, -1, 0, 1, 1, 1, 1);
+    // Trailing 0 is castShadow, forwarded from the Light component's (unset, default-false) flag.
+    expect(fakeGpu.setDirectionalLight).toHaveBeenCalledWith(0, -1, 0, 1, 1, 1, 1, 0);
   });
 
   it("computes exact spot light arguments: position, direction, color, and cone angles", async () => {

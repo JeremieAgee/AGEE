@@ -1,4 +1,5 @@
 import { MinHeap } from "../core/BinaryHeap";
+import type { Blackboard } from "./BehaviorTree";
 
 export type WorldState = Map<string, number | boolean>;
 export type GOAPActionFn = (eid: number, dt: number, state: WorldState) => "running" | "done" | "failed";
@@ -75,6 +76,20 @@ interface PlanNode {
   depth: number;
 }
 
+// A search in progress, resumable across multiple stepSearch() calls so a single agent's
+// up-to-500-iteration plan search can be spread across several AISystem.update() frames
+// instead of running to completion in one.
+interface SearchState {
+  actions: GOAPAction[];
+  goalState: WorldState;
+  open: MinHeap<PlanNode>;
+  stateKeys: string[];
+  bestCostForState: Map<string, number>;
+  bestNode: PlanNode | null;
+  bestCost: number;
+  iterations: number;
+}
+
 export interface GOAPInstance {
   domain: GOAPDomain;
   worldState: WorldState;
@@ -84,11 +99,23 @@ export interface GOAPInstance {
   actionStatus: "idle" | "running" | "done" | "failed";
   replanCooldown: number;
   replanInterval: number;
+  pendingSearch: SearchState | null;
 }
 
 export class GOAPPlanner {
   private maxPlanDepth = 10;
   private maxIterations = 500;
+  // Total search iterations (state-map clones) every GOAP agent combined may spend inside a
+  // single AISystem.update() call. About 4x one agent's own maxIterations, so a handful of
+  // agents replanning on the same frame — the common case, since agents created with the same
+  // default replanInterval tend to line up — still finish in one frame, while a much larger
+  // pile of simultaneous replans spreads its cost across several frames instead of spiking one.
+  private iterationBudgetPerFrame = 2000;
+  private remainingBudget = this.iterationBudgetPerFrame;
+
+  beginFrame(): void {
+    this.remainingBudget = this.iterationBudgetPerFrame;
+  }
 
   createInstance(domain: GOAPDomain, replanInterval = 1.0): GOAPInstance {
     return {
@@ -100,13 +127,23 @@ export class GOAPPlanner {
       actionStatus: "idle",
       replanCooldown: 0,
       replanInterval,
+      pendingSearch: null,
     };
   }
 
-  tick(eid: number, instance: GOAPInstance, dt: number): string {
+  tick(eid: number, instance: GOAPInstance, dt: number, blackboard?: Blackboard | null): string {
+    if (blackboard?.has("hasTarget")) {
+      instance.worldState.set("hasTarget", blackboard.get<boolean>("hasTarget")!);
+      instance.worldState.set("targetEntity", blackboard.get<number>("targetEntity")!);
+      instance.worldState.set("alertLevel", blackboard.get<number>("alertLevel")!);
+      instance.worldState.set("targetLastX", blackboard.get<number>("targetLastX")!);
+      instance.worldState.set("targetLastY", blackboard.get<number>("targetLastY")!);
+      instance.worldState.set("targetLastZ", blackboard.get<number>("targetLastZ")!);
+    }
+
     instance.replanCooldown -= dt;
 
-    if (instance.actionStatus === "failed" || instance.plan.length === 0 || instance.replanCooldown <= 0) {
+    if (instance.actionStatus === "failed" || instance.plan.length === 0 || instance.replanCooldown <= 0 || instance.pendingSearch) {
       this.selectGoalAndPlan(eid, instance);
     }
 
@@ -143,31 +180,49 @@ export class GOAPPlanner {
   }
 
   private selectGoalAndPlan(eid: number, instance: GOAPInstance): void {
-    instance.replanCooldown = instance.replanInterval;
+    if (!instance.pendingSearch) {
+      // Budget already spent by other agents this frame -- leave the trigger conditions in
+      // tick() unsatisfied-and-retried (plan stays empty / actionStatus stays "failed") so
+      // this agent's goal pick and search start on a later frame instead of starving forever.
+      if (this.remainingBudget <= 0) return;
 
-    let bestGoal: GOAPGoal | null = null;
-    let bestPriority = -Infinity;
+      instance.replanCooldown = instance.replanInterval;
 
-    for (const goal of instance.domain.goals) {
-      const p = goal.priority(eid, instance.worldState);
-      if (p > bestPriority && !this.goalSatisfied(goal, instance.worldState)) {
-        bestPriority = p;
-        bestGoal = goal;
+      let bestGoal: GOAPGoal | null = null;
+      let bestPriority = -Infinity;
+
+      for (const goal of instance.domain.goals) {
+        const p = goal.priority(eid, instance.worldState);
+        if (p > bestPriority && !this.goalSatisfied(goal, instance.worldState)) {
+          bestPriority = p;
+          bestGoal = goal;
+        }
       }
+
+      if (!bestGoal) {
+        instance.currentGoal = null;
+        instance.plan = [];
+        instance.planIndex = 0;
+        return;
+      }
+
+      instance.currentGoal = bestGoal;
+      instance.pendingSearch = this.beginSearch(instance.domain.actions, instance.worldState, bestGoal.conditions);
     }
 
-    if (!bestGoal) {
-      instance.currentGoal = null;
-      instance.plan = [];
+    if (this.remainingBudget <= 0) return;
+
+    const search = instance.pendingSearch;
+    const before = search.iterations;
+    const status = this.stepSearch(search, this.remainingBudget);
+    this.remainingBudget -= search.iterations - before;
+
+    if (status === "done") {
+      instance.plan = this.extractPlan(search);
+      instance.pendingSearch = null;
       instance.planIndex = 0;
-      return;
+      instance.actionStatus = instance.plan.length > 0 ? "running" : "idle";
     }
-
-    instance.currentGoal = bestGoal;
-    const plan = this.plan(instance.domain.actions, instance.worldState, bestGoal.conditions);
-    instance.plan = plan;
-    instance.planIndex = 0;
-    instance.actionStatus = plan.length > 0 ? "running" : "idle";
   }
 
   private goalSatisfied(goal: GOAPGoal, state: WorldState): boolean {
@@ -178,6 +233,16 @@ export class GOAPPlanner {
   }
 
   plan(actions: GOAPAction[], currentState: WorldState, goalState: WorldState): GOAPAction[] {
+    const search = this.beginSearch(actions, currentState, goalState);
+    this.stepSearch(search, this.maxIterations);
+    return this.extractPlan(search);
+  }
+
+  // Builds the initial search frontier from `currentState` toward `goalState`. Split out from
+  // the iteration loop (stepSearch) so AISystem's hot path can spend a capped number of
+  // iterations on it per frame and resume the same search next frame instead of blocking until
+  // it's fully solved (see selectGoalAndPlan).
+  private beginSearch(actions: GOAPAction[], currentState: WorldState, goalState: WorldState): SearchState {
     const start: PlanNode = { state: new Map(currentState), action: null, cost: 0, parent: null, depth: 0 };
     // GOAP's search never needs to decrease an in-heap node's key (a cheaper route to an
     // already-queued state is just pushed as a new node and the stale one is filtered out on
@@ -187,8 +252,8 @@ export class GOAPPlanner {
     open.push(start, start.cost);
     // Fixed, pre-sorted list of every key that can ever appear in a state reached from
     // `start` (a successor state only ever gains keys via action.effects, never loses any —
-    // see the plain `new Map(current.state)` + `.set()` below). Computed once per plan() call
-    // so stateKey() below can build a canonical string by walking this instead of re-deriving
+    // see the plain `new Map(current.state)` + `.set()` below). Computed once per search so
+    // stateKey() below can build a canonical string by walking this instead of re-deriving
     // and re-sorting `Array.from(state.keys())` from scratch on every single node, which was
     // the search's dominant source of allocation churn (called for every expanded node and
     // every one of its successors, with maxIterations up to 500 and one GOAP instance replanning
@@ -200,13 +265,21 @@ export class GOAPPlanner {
     // duplicate work instead of exploring new states.
     const bestCostForState = new Map<string, number>();
     bestCostForState.set(this.stateKey(start.state, stateKeys), 0);
-    let iterations = 0;
 
-    let bestNode: PlanNode | null = null;
-    let bestCost = Infinity;
+    return { actions, goalState, open, stateKeys, bestCostForState, bestNode: null, bestCost: Infinity, iterations: 0 };
+  }
 
-    while (open.length > 0 && iterations < this.maxIterations) {
-      iterations++;
+  // Runs up to `budget` more iterations of `search` from wherever it last left off. Returns
+  // "done" once the frontier is exhausted or the search's own maxIterations cap is hit, or
+  // "pending" if it stopped early only because `budget` ran out (more work remains for a later
+  // call).
+  private stepSearch(search: SearchState, budget: number): "done" | "pending" {
+    const { actions, goalState, open, stateKeys, bestCostForState } = search;
+    let spent = 0;
+
+    while (open.length > 0 && search.iterations < this.maxIterations && spent < budget) {
+      search.iterations++;
+      spent++;
 
       const current = open.pop()!;
 
@@ -216,9 +289,9 @@ export class GOAPPlanner {
       if (current.cost > (bestCostForState.get(key) ?? Infinity)) continue;
 
       if (this.stateContains(current.state, goalState)) {
-        if (current.cost < bestCost) {
-          bestCost = current.cost;
-          bestNode = current;
+        if (current.cost < search.bestCost) {
+          search.bestCost = current.cost;
+          search.bestNode = current;
         }
         continue;
       }
@@ -250,10 +323,14 @@ export class GOAPPlanner {
       }
     }
 
-    if (!bestNode) return [];
+    return open.length === 0 || search.iterations >= this.maxIterations ? "done" : "pending";
+  }
+
+  private extractPlan(search: SearchState): GOAPAction[] {
+    if (!search.bestNode) return [];
 
     const result: GOAPAction[] = [];
-    let node: PlanNode | null = bestNode;
+    let node: PlanNode | null = search.bestNode;
     while (node && node.action) {
       result.unshift(node.action);
       node = node.parent;

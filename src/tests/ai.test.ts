@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 
 import { BehaviorTreeRunner, Blackboard, BTNode } from "../ai/BehaviorTree";
 import { FSMBuilder, FSMRunner } from "../ai/FSM";
@@ -8,6 +8,7 @@ import { SteeringSystem, SteeringAgent, SteeringFlag } from "../ai/SteeringBehav
 import { AISystem, AIAgent, Perception } from "../ai/AISystem";
 import { World } from "../ecs/World";
 import { Transform } from "../core/Components";
+import * as DeterministicMath from "../core/DeterministicMath";
 
 function approx(a: number, b: number, eps = 1e-4): boolean {
   return Math.abs(a - b) < eps;
@@ -722,14 +723,13 @@ describe("SteeringBehaviors — Wander", () => {
 });
 
 // ===========================================================================
-// BUG #4 (AUDIT, optional/low-priority): flocking (Separation/Alignment/Cohesion) is
-// O(n^2) -- every steering entity is checked against every other entity each frame,
-// with no use of the engine's SpatialHash. See SteeringBehaviors.ts:231 (nested loop).
-// Demonstrated via a deterministic count of Math.sqrt calls in the neighbor loop
-// (not wall-clock timing, to avoid flaky CI).
+// Flocking (Separation/Alignment/Cohesion) queries a SpatialHash for neighbor candidates
+// instead of scanning every other steering entity, so a distance check (and thus a dsqrt call)
+// only happens against nearby candidates. Demonstrated via a deterministic count of dsqrt calls
+// in the neighbor loop (not wall-clock timing, to avoid flaky CI).
 // ===========================================================================
 
-describe("SteeringBehaviors — BUG: flocking neighbor search is O(n^2)", () => {
+describe("SteeringBehaviors — flocking neighbor search uses a spatial partition", () => {
   function countSqrtCallsForNEntities(n: number): number {
     const { world, system } = makeSteeringWorld();
     for (let i = 0; i < n; i++) {
@@ -739,19 +739,21 @@ describe("SteeringBehaviors — BUG: flocking neighbor search is O(n^2)", () => 
         behaviors: SteeringFlag.Separation,
       });
     }
-    const originalSqrt = Math.sqrt;
+    const originalSqrt = DeterministicMath.dsqrt;
     let count = 0;
-    Math.sqrt = ((v: number) => { count++; return originalSqrt(v); }) as typeof Math.sqrt;
+    const spy = vi.spyOn(DeterministicMath, "dsqrt").mockImplementation((v: number) => {
+      count++;
+      return originalSqrt(v);
+    });
     try {
       system.update(1 / 60);
     } finally {
-      Math.sqrt = originalSqrt;
+      spy.mockRestore();
     }
     return count;
   }
 
-  it("Math.sqrt call count should scale roughly linearly with a spatial partition, not quadratically", () => {
-    // AUDIT: flocking has no spatial partition despite the engine having a SpatialHash — see SteeringBehaviors.ts:231
+  it("dsqrt call count should scale roughly linearly with a spatial partition, not quadratically", () => {
     const countAt10 = countSqrtCallsForNEntities(10);
     const countAt20 = countSqrtCallsForNEntities(20);
     const ratio = countAt20 / countAt10;

@@ -5,6 +5,7 @@ import { Handle, HandleMap } from "../core/handles/Handle";
 import { FSMDefinition, FSMInstance, FSMRunner } from "./FSM";
 import { UtilitySet, UtilityInstance, UtilityRunner } from "./UtilityAI";
 import { GOAPDomain, GOAPInstance, GOAPPlanner } from "./GOAP";
+import { SpatialHash } from "../core/spatial/SpatialHash";
 
 export const enum AIType { BehaviorTree = 0, FSM = 1, Utility = 2, GOAP = 3 }
 
@@ -60,6 +61,13 @@ export class AISystem extends System {
   private perceptionQuery!: ReturnType<World["query"]>;
   private allTransformQuery!: ReturnType<World["query"]>;
   private factionFilter: ((perceiver: number, target: number) => boolean) | null = null;
+
+  // Broad-phase candidate gathering for updatePerception() -- replaces an all-pairs
+  // perceivers x targets scan, matching the SpatialHash pattern SteeringSystem already uses
+  // for its flocking neighbor search. Rebuilt once per update() (positions move every frame).
+  private static readonly PERCEPTION_CELL_SIZE = 8;
+  private perceptionHash = new SpatialHash(AISystem.PERCEPTION_CELL_SIZE);
+  private perceptionCandidates: number[] = [];
 
   setFactionFilter(fn: (perceiver: number, target: number) => boolean): void {
     this.factionFilter = fn;
@@ -181,6 +189,8 @@ export class AISystem extends System {
 
   // Hot loop — reads SOA columns for tick gating, resolves handles only when ticking
   update(dt: number): void {
+    this.goapPlanner.beginFrame();
+
     const entities = this.agentQuery.entities;
     const active = this.agentStore.getColumn("active");
     const tickRates = this.agentStore.getColumn("tickRate");
@@ -254,14 +264,14 @@ export class AISystem extends System {
         case AIType.Utility: {
           const util = this.utilityPool.get(instanceHandles[eid]);
           if (!util) break;
-          this.utilityRunner.tick(eid, util, dt);
+          this.utilityRunner.tick(eid, util, dt, bb);
           lastStatuses[eid] = 0;
           break;
         }
         case AIType.GOAP: {
           const goap = this.goapPool.get(instanceHandles[eid]);
           if (!goap) break;
-          const result = this.goapPlanner.tick(eid, goap, dt);
+          const result = this.goapPlanner.tick(eid, goap, dt, bb);
           lastStatuses[eid] = result === "failed" ? 1 : result === "idle" || result === "done" ? 0 : 2;
           break;
         }
@@ -291,6 +301,12 @@ export class AISystem extends System {
     const tz = this.transformStore.getColumn("z");
     const ry = this.transformStore.getColumn("ry");
 
+    this.perceptionHash.clear();
+    for (let j = 0; j < targets.length; j++) {
+      const t = targets[j];
+      this.perceptionHash.insert(t, tx[t], tz[t]);
+    }
+
     for (let i = 0; i < perceivers.length; i++) {
       const eid = perceivers[i];
       const range = sightRanges[eid];
@@ -304,8 +320,15 @@ export class AISystem extends System {
       let closestDist = rangeSq;
       let closestTarget = -1;
 
-      for (let j = 0; j < targets.length; j++) {
-        const other = targets[j];
+      // XZ-radius query against the sight range as broad phase -- a true 3D distance can
+      // only be >= its XZ projection, so every candidate that could pass the 3D distSq check
+      // below is guaranteed to fall inside this 2D circle (some extra candidates with a large
+      // Y offset may come back too, but those are filtered out by the exact check below same
+      // as before).
+      const candidates = this.perceptionHash.queryRadius(tx[eid], tz[eid], range, this.perceptionCandidates);
+
+      for (let j = 0; j < candidates.length; j++) {
+        const other = candidates[j];
         if (other === eid) continue;
 
         if (this.factionFilter && !this.factionFilter(eid, other)) continue;

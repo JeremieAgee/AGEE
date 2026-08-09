@@ -3,6 +3,7 @@ export class SpatialHash {
   private invCellSize: number;
   private cells = new Map<string, number[]>();
   private entityCell = new Map<number, string>();
+  private entityPos = new Map<number, { x: number; z: number }>();
 
   constructor(cellSize: number = 16) {
     this.cellSize = cellSize;
@@ -33,6 +34,7 @@ export class SpatialHash {
     }
     cell.push(eid);
     this.entityCell.set(eid, h);
+    this.entityPos.set(eid, { x, z });
   }
 
   remove(eid: number): void {
@@ -48,6 +50,7 @@ export class SpatialHash {
       if (cell.length === 0) this.cells.delete(h);
     }
     this.entityCell.delete(eid);
+    this.entityPos.delete(eid);
   }
 
   update(eid: number, x: number, z: number): void {
@@ -67,7 +70,11 @@ export class SpatialHash {
         const cell = this.cells.get(this.hash(gx, gz));
         if (cell) {
           for (let i = 0; i < cell.length; i++) {
-            results.push(cell[i]);
+            const eid = cell[i];
+            const pos = this.entityPos.get(eid);
+            if (!pos) continue;
+            const dx = pos.x - cx, dz = pos.z - cz;
+            if (dx * dx + dz * dz <= r2) results.push(eid);
           }
         }
       }
@@ -98,5 +105,6 @@ export class SpatialHash {
   clear(): void {
     this.cells.clear();
     this.entityCell.clear();
+    this.entityPos.clear();
   }
 }

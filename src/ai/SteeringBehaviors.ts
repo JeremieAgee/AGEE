@@ -1,6 +1,7 @@
 import { System, World, ComponentStore, defineComponent } from "../ecs";
 import { Transform } from "../core/Components";
 import { SpatialHash } from "../core/spatial/SpatialHash";
+import { dsqrt, dsin, dcos, datan2, dmin, SeededRNG } from "../core/DeterministicMath";
 
 export const SteeringAgent = defineComponent("SteeringAgent", {
   maxSpeed: "f32",
@@ -78,6 +79,11 @@ export class SteeringSystem extends System {
   private static readonly MAX_SUBSTEPS = 8;
   private accumulator = 0;
 
+  // Deterministic in place of Math.random(): the wander behavior mutates simulation
+  // state, so an unseeded RNG source would make two clients replaying identical inputs
+  // diverge. Seeded fixed so the same input stream reproduces the same wander path.
+  private wanderRng = new SeededRNG(0x5eed1e5);
+
   init(): void {
     this.steerStore = this.world.getStore(SteeringAgent);
     this.transformStore = this.world.getStore(Transform);
@@ -144,7 +150,7 @@ export class SteeringSystem extends System {
 
       if (flags & SteeringFlag.Seek) {
         const dx = tgtXs[eid] - px, dy = tgtYs[eid] - py, dz = tgtZs[eid] - pz;
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const dist = dsqrt(dx * dx + dy * dy + dz * dz);
         if (dist > 0.001) {
           const s = maxS / dist;
           fx += dx * s - vxs[eid];
@@ -155,7 +161,7 @@ export class SteeringSystem extends System {
 
       if (flags & SteeringFlag.Flee) {
         const dx = px - tgtXs[eid], dy = py - tgtYs[eid], dz = pz - tgtZs[eid];
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const dist = dsqrt(dx * dx + dy * dy + dz * dz);
         if (dist > 0.001) {
           const s = maxS / dist;
           fx += dx * s - vxs[eid];
@@ -166,7 +172,7 @@ export class SteeringSystem extends System {
 
       if (flags & SteeringFlag.Arrive) {
         const dx = tgtXs[eid] - px, dy = tgtYs[eid] - py, dz = tgtZs[eid] - pz;
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const dist = dsqrt(dx * dx + dy * dy + dz * dz);
         if (dist > arriveRadii[eid]) {
           let desiredSpeed = maxS;
           const slow = slowRadii[eid];
@@ -183,10 +189,10 @@ export class SteeringSystem extends System {
       }
 
       if (flags & SteeringFlag.Wander) {
-        wanderAngles[eid] += (Math.random() - 0.5) * wanderJitters[eid];
+        wanderAngles[eid] += (this.wanderRng.next() - 0.5) * wanderJitters[eid];
         const wr = wanderRadii[eid];
         const wd = wanderDists[eid];
-        const speed = Math.sqrt(vxs[eid] * vxs[eid] + vzs[eid] * vzs[eid]);
+        const speed = dsqrt(vxs[eid] * vxs[eid] + vzs[eid] * vzs[eid]);
         let headX = 0, headZ = 1;
         if (speed > 0.001) {
           headX = vxs[eid] / speed;
@@ -195,10 +201,10 @@ export class SteeringSystem extends System {
         const circX = px + headX * wd;
         const circZ = pz + headZ * wd;
         const angle = wanderAngles[eid];
-        const targX = circX + Math.cos(angle) * wr;
-        const targZ = circZ + Math.sin(angle) * wr;
+        const targX = circX + dcos(angle) * wr;
+        const targZ = circZ + dsin(angle) * wr;
         const dx = targX - px, dz = targZ - pz;
-        const d = Math.sqrt(dx * dx + dz * dz);
+        const d = dsqrt(dx * dx + dz * dz);
         if (d > 0.001) {
           fx += (dx / d) * maxS - vxs[eid];
           fz += (dz / d) * maxS - vzs[eid];
@@ -215,12 +221,12 @@ export class SteeringSystem extends System {
             tvz = vzs[tEid];
           }
           const dx = tpx - px, dz = tpz - pz;
-          const dist = Math.sqrt(dx * dx + dz * dz);
-          const lookAhead = dist / (maxS + Math.sqrt(tvx * tvx + tvz * tvz) + 0.001);
+          const dist = dsqrt(dx * dx + dz * dz);
+          const lookAhead = dist / (maxS + dsqrt(tvx * tvx + tvz * tvz) + 0.001);
           const predX = tpx + tvx * lookAhead;
           const predZ = tpz + tvz * lookAhead;
           const ddx = predX - px, ddz = predZ - pz;
-          const dd = Math.sqrt(ddx * ddx + ddz * ddz);
+          const dd = dsqrt(ddx * ddx + ddz * ddz);
           if (dd > 0.001) {
             fx += (ddx / dd) * maxS - vxs[eid];
             fz += (ddz / dd) * maxS - vzs[eid];
@@ -238,12 +244,12 @@ export class SteeringSystem extends System {
             tvz = vzs[tEid];
           }
           const dx = tpx - px, dz = tpz - pz;
-          const dist = Math.sqrt(dx * dx + dz * dz);
-          const lookAhead = dist / (maxS + Math.sqrt(tvx * tvx + tvz * tvz) + 0.001);
+          const dist = dsqrt(dx * dx + dz * dz);
+          const lookAhead = dist / (maxS + dsqrt(tvx * tvx + tvz * tvz) + 0.001);
           const predX = tpx + tvx * lookAhead;
           const predZ = tpz + tvz * lookAhead;
           const ddx = px - predX, ddz = pz - predZ;
-          const dd = Math.sqrt(ddx * ddx + ddz * ddz);
+          const dd = dsqrt(ddx * ddx + ddz * ddz);
           if (dd > 0.001) {
             fx += (ddx / dd) * maxS - vxs[eid];
             fz += (ddz / dd) * maxS - vzs[eid];
@@ -275,7 +281,7 @@ export class SteeringSystem extends System {
         // search radius is capped at the cell size so a pathologically large neighborRadius
         // can't blow up the number of cells visited; the exact distSq check below still
         // enforces the real neighborRadius against whatever candidates were found.
-        const searchRadius = Math.min(nRadius, SteeringSystem.FLOCK_CELL_SIZE);
+        const searchRadius = dmin(nRadius, SteeringSystem.FLOCK_CELL_SIZE);
         const candidates = this.flockHash.queryRadius(px, pz, searchRadius, this.flockCandidates);
 
         for (let j = 0; j < candidates.length; j++) {
@@ -288,7 +294,7 @@ export class SteeringSystem extends System {
           if (distSq > nRadiusSq || distSq < 0.0001) continue;
 
           neighborCount++;
-          const dist = Math.sqrt(distSq);
+          const dist = dsqrt(distSq);
 
           if (flags & SteeringFlag.Separation) {
             // Unit vector (dx/dist) scaled again by 1/dist, so repulsion strength actually
@@ -329,7 +335,7 @@ export class SteeringSystem extends System {
       }
 
       // Truncate to max force
-      const fMag = Math.sqrt(fx * fx + fy * fy + fz * fz);
+      const fMag = dsqrt(fx * fx + fy * fy + fz * fz);
       if (fMag > maxF) {
         const s = maxF / fMag;
         fx *= s; fy *= s; fz *= s;
@@ -346,7 +352,7 @@ export class SteeringSystem extends System {
       vzs[eid] += (fz / m) * dt;
 
       // Clamp velocity to maxSpeed
-      const speed = Math.sqrt(vxs[eid] * vxs[eid] + vys[eid] * vys[eid] + vzs[eid] * vzs[eid]);
+      const speed = dsqrt(vxs[eid] * vxs[eid] + vys[eid] * vys[eid] + vzs[eid] * vzs[eid]);
       if (speed > maxS) {
         const clamp = maxS / speed;
         vxs[eid] *= clamp;
@@ -361,7 +367,7 @@ export class SteeringSystem extends System {
 
       // Face movement direction
       if (speed > 0.01) {
-        ry[eid] = Math.atan2(vxs[eid], vzs[eid]);
+        ry[eid] = datan2(vxs[eid], vzs[eid]);
       }
     }
   }

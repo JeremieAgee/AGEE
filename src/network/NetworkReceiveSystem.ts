@@ -10,6 +10,8 @@ import {
   ComponentRegistry,
   ActionRegistry,
   readMessageHeader,
+  writeConnect,
+  readConnect,
   readConnectAck,
   readSnapshot,
   readDeltaSnapshot,
@@ -87,6 +89,22 @@ export class NetworkReceiveSystem extends System {
   // Client-mode: callback for prediction replay
   private _onReconcile: ((serverTick: number, inputs: InputPayload[]) => void) | null = null;
 
+  // Client-mode: token sent in the Connect handshake once the transport reports "connected" —
+  // see dispatchEvent()'s "connected" case. Set via NetworkManager.connect(url, token).
+  private connectToken = "";
+  private connectWriter = new BinaryWriter(64);
+
+  // Server-mode: fired when a Connect message arrives from an already-registered client
+  // transport (see addClientTransport/NetworkManager.addClient), so host code can act on the
+  // client's self-reported token (e.g. deferred/async auth) beyond whatever addClient() itself
+  // already validated synchronously. Not required — a server that only relies on addClient()'s
+  // own token check can leave this unset.
+  private _onConnectRequest: ((token: string, transport: Transport, clientId: number) => void) | null = null;
+
+  set onConnectRequest(fn: ((token: string, transport: Transport, clientId: number) => void) | null) {
+    this._onConnectRequest = fn;
+  }
+
   // Server-mode: notified when a client's transport reports "disconnected", so the owner
   // (NetworkManager) can clean up whatever it tracks for that client (NetworkSendSystem's
   // connectedClients entry, etc). Without this, an ungraceful disconnect only logged a
@@ -129,6 +147,9 @@ export class NetworkReceiveSystem extends System {
   set localClientId(id: number) { this._localClientId = id; }
   get localClientId(): number { return this._localClientId; }
   get lastReceivedTick(): number { return this._lastReceivedTick; }
+
+  /** Client-mode: the token sent in the Connect handshake once the transport connects. */
+  set localConnectToken(token: string) { this.connectToken = token; }
 
   set onReconcile(fn: ((serverTick: number, inputs: InputPayload[]) => void) | null) {
     this._onReconcile = fn;
@@ -177,6 +198,17 @@ export class NetworkReceiveSystem extends System {
 
   private dispatchEvent(ev: TransportEvent, sourceTransport: Transport, trustedClientId: number | undefined): void {
     switch (ev.type) {
+      case "connected":
+        // AUDIT FIX: writeConnect() previously had zero call sites anywhere in the engine, so
+        // a client's transport reaching "connected" never actually sent the app-level Connect
+        // handshake the protocol defines -- only the raw socket opened. This is the client side
+        // of that handshake; addClient() (NetworkManager) sends the server's ConnectAck reply.
+        if (this.role === "client") {
+          this.connectWriter.reset();
+          writeConnect(this.connectWriter, this.connectToken);
+          sourceTransport.send(this.connectWriter.toArrayBuffer());
+        }
+        break;
       case "message":
         this.handleMessage(ev.data, sourceTransport, trustedClientId);
         break;
@@ -215,11 +247,22 @@ export class NetworkReceiveSystem extends System {
       if (this.role === "server" && (header.type === MessageType.Snapshot || header.type === MessageType.DeltaSnapshot || header.type === MessageType.ConnectAck)) {
         return;
       }
-      if (this.role === "client" && header.type === MessageType.Input) {
+      if (this.role === "client" && (header.type === MessageType.Input || header.type === MessageType.Connect)) {
         return;
       }
 
       switch (header.type) {
+        case MessageType.Connect: {
+          const { token } = readConnect(reader);
+          // Only meaningful for a transport host code has already registered via
+          // addClientTransport/addClient (see NetworkManager.addClient) — an unregistered
+          // transport has no clientId yet and there's nothing to acknowledge it as.
+          if (trustedClientId !== undefined) {
+            this._onConnectRequest?.(token, sourceTransport, trustedClientId);
+          }
+          break;
+        }
+
         case MessageType.ConnectAck: {
           const ack = readConnectAck(reader);
           this._localClientId = ack.clientId;

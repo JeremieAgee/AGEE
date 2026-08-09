@@ -2,7 +2,7 @@ import { World } from "../ecs";
 import { ComponentDef } from "../ecs/Component";
 import { ComponentStore } from "../ecs/ComponentStore";
 import { ComponentRegistry } from "./NetworkProtocol";
-import { Replicated } from "./NetworkComponents";
+import { Replicated, NetworkOwner } from "./NetworkComponents";
 import {
   NETWORK_CONSTANTS,
   Snapshot,
@@ -215,6 +215,7 @@ export class SnapshotManager {
   ): { spawns: SnapshotEntry[]; despawns: number[] } {
     const spawns: SnapshotEntry[] = [];
     const seenIds = new Set<number>();
+    const ownerStore = this.world.getStore(NetworkOwner);
 
     for (const entry of snapshot.entries) {
       seenIds.add(entry.networkId);
@@ -224,6 +225,14 @@ export class SnapshotManager {
         spawns.push(entry);
         continue;
       }
+
+      // A locally-authoritative entity (the client's own predicted player) must not have its
+      // networked state blindly overwritten here -- NetworkReceiveSystem.reconcile() is the
+      // sole writer for it, and only when the server's position has actually diverged from the
+      // client's prediction by more than POSITION_EPSILON. Overwriting it unconditionally first
+      // made that divergence check always read ~0 (local and server state were already made
+      // identical by this loop), so reconciliation/replay never actually ran.
+      if (ownerStore.has(eid) && ownerStore.get(eid, "authoritative") === 1) continue;
 
       for (const [compName, fields] of entry.components) {
         const def = this.replicatedDefs.find(d => d.name === compName);

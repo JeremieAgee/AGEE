@@ -1,4 +1,5 @@
 import { AssetId, AssetType, LoadStatus, AssetHandle, INVALID_ASSET } from "./AssetTypes";
+import { HandleAllocator, handleIndex } from "../core/handles/Handle";
 
 const INITIAL_CAPACITY = 256;
 
@@ -12,15 +13,24 @@ export class AssetStore {
   private _data: any[];
   private _dependencies: number[][];
   private _errors: (string | null)[];
+  private _memorySize: Float64Array;
 
-  private count = 0;
   private capacity: number;
-  private freeList: number[] = [];
-  private idToSlot = new Map<AssetId, number>();
+  // Generational allocator (index + generation packed into the handle) instead of a bare
+  // slot-index freeList. Without a generation check, releasing an asset whose load is still
+  // in flight (refcount hits 0 before the promise settles) frees its slot for immediate reuse
+  // by an unrelated register() call; when the stale load's callback later fires and calls
+  // setLoaded(handle, ...), `handle` is just a plain number indistinguishable from the new
+  // occupant's handle, so it silently stomps the new asset's data. Every accessor below
+  // validates the handle's generation against the slot's current one first, so a stale handle
+  // becomes a safe no-op instead of corrupting whatever now lives in that slot.
+  private allocator: HandleAllocator;
+  private idToHandle = new Map<AssetId, AssetHandle>();
   private pathToId = new Map<string, AssetId>();
 
   constructor(capacity: number = INITIAL_CAPACITY) {
     this.capacity = capacity;
+    this.allocator = new HandleAllocator(capacity);
     this._ids = new Array(capacity).fill("");
     this._types = new Uint8Array(capacity);
     this._status = new Uint8Array(capacity);
@@ -29,13 +39,17 @@ export class AssetStore {
     this._data = new Array(capacity).fill(null);
     this._dependencies = new Array(capacity).fill(null).map(() => []);
     this._errors = new Array(capacity).fill(null);
+    this._memorySize = new Float64Array(capacity);
   }
 
   register(id: AssetId, type: AssetType, path: string): AssetHandle {
-    const existing = this.idToSlot.get(id);
-    if (existing !== undefined) return existing as AssetHandle;
+    const existing = this.idToHandle.get(id);
+    if (existing !== undefined) return existing;
 
-    const slot = this.allocSlot();
+    const handle = this.allocator.alloc() as AssetHandle;
+    const slot = handleIndex(handle);
+    if (slot >= this.capacity) this.grow(slot + 1);
+
     this._ids[slot] = id;
     this._types[slot] = type;
     this._status[slot] = LoadStatus.Unloaded;
@@ -44,44 +58,68 @@ export class AssetStore {
     this._data[slot] = null;
     this._dependencies[slot] = [];
     this._errors[slot] = null;
+    this._memorySize[slot] = 0;
 
-    this.idToSlot.set(id, slot);
+    this.idToHandle.set(id, handle);
     this.pathToId.set(path, id);
-    return slot as AssetHandle;
+    return handle;
+  }
+
+  setMemorySize(handle: AssetHandle, bytes: number): void {
+    if (!this.isValid(handle)) return;
+    this._memorySize[handleIndex(handle)] = bytes;
+  }
+
+  getMemorySize(handle: AssetHandle): number {
+    return this.isValid(handle) ? this._memorySize[handleIndex(handle)] : 0;
+  }
+
+  private isValid(handle: AssetHandle): boolean {
+    return handle !== INVALID_ASSET && this.allocator.isValid(handle);
   }
 
   setLoading(handle: AssetHandle): void {
-    this._status[handle] = LoadStatus.Loading;
+    if (!this.isValid(handle)) return;
+    this._status[handleIndex(handle)] = LoadStatus.Loading;
   }
 
   setLoaded(handle: AssetHandle, data: any): void {
-    this._status[handle] = LoadStatus.Loaded;
-    this._data[handle] = data;
-    this._errors[handle] = null;
+    if (!this.isValid(handle)) return;
+    const slot = handleIndex(handle);
+    this._status[slot] = LoadStatus.Loaded;
+    this._data[slot] = data;
+    this._errors[slot] = null;
   }
 
   setFailed(handle: AssetHandle, error: string): void {
-    this._status[handle] = LoadStatus.Failed;
-    this._errors[handle] = error;
+    if (!this.isValid(handle)) return;
+    const slot = handleIndex(handle);
+    this._status[slot] = LoadStatus.Failed;
+    this._errors[slot] = error;
   }
 
   addDependency(handle: AssetHandle, depHandle: AssetHandle): void {
+    if (!this.isValid(handle)) return;
+    const slot = handleIndex(handle);
     // Guards against double-registering the same dependency (e.g. a caller re-running a
     // load pass for an id that's already registered) — without this, release() would walk
     // the duplicate entry and release depHandle an extra time it was never actually
     // retained for, over-releasing it out from under whatever still legitimately holds it.
-    if (this._dependencies[handle].includes(depHandle)) return;
-    this._dependencies[handle].push(depHandle);
+    if (this._dependencies[slot].includes(depHandle)) return;
+    this._dependencies[slot].push(depHandle);
   }
 
   retain(handle: AssetHandle): void {
-    this._refCount[handle]++;
+    if (!this.isValid(handle)) return;
+    this._refCount[handleIndex(handle)]++;
   }
 
   release(handle: AssetHandle): boolean {
-    if (this._refCount[handle] === 0) return false;
-    this._refCount[handle]--;
-    if (this._refCount[handle] === 0) {
+    if (!this.isValid(handle)) return false;
+    const slot = handleIndex(handle);
+    if (this._refCount[slot] === 0) return false;
+    this._refCount[slot]--;
+    if (this._refCount[slot] === 0) {
       return true; // caller should dispose
     }
     return false;
@@ -89,21 +127,21 @@ export class AssetStore {
 
   // ── Getters (SOA column access) ──
 
-  getId(handle: AssetHandle): AssetId { return this._ids[handle]; }
-  getType(handle: AssetHandle): AssetType { return this._types[handle]; }
-  getStatus(handle: AssetHandle): LoadStatus { return this._status[handle]; }
-  getRefCount(handle: AssetHandle): number { return this._refCount[handle]; }
-  getPath(handle: AssetHandle): string { return this._paths[handle]; }
-  getData<T = any>(handle: AssetHandle): T | null { return this._data[handle]; }
-  getError(handle: AssetHandle): string | null { return this._errors[handle]; }
-  getDependencies(handle: AssetHandle): number[] { return this._dependencies[handle]; }
+  getId(handle: AssetHandle): AssetId { return this.isValid(handle) ? this._ids[handleIndex(handle)] : ""; }
+  getType(handle: AssetHandle): AssetType { return this.isValid(handle) ? this._types[handleIndex(handle)] : AssetType.Texture; }
+  getStatus(handle: AssetHandle): LoadStatus { return this.isValid(handle) ? this._status[handleIndex(handle)] : LoadStatus.Unloaded; }
+  getRefCount(handle: AssetHandle): number { return this.isValid(handle) ? this._refCount[handleIndex(handle)] : 0; }
+  getPath(handle: AssetHandle): string { return this.isValid(handle) ? this._paths[handleIndex(handle)] : ""; }
+  getData<T = any>(handle: AssetHandle): T | null { return this.isValid(handle) ? this._data[handleIndex(handle)] : null; }
+  getError(handle: AssetHandle): string | null { return this.isValid(handle) ? this._errors[handleIndex(handle)] : null; }
+  getDependencies(handle: AssetHandle): number[] { return this.isValid(handle) ? this._dependencies[handleIndex(handle)] : []; }
 
-  isLoaded(handle: AssetHandle): boolean { return this._status[handle] === LoadStatus.Loaded; }
-  isLoading(handle: AssetHandle): boolean { return this._status[handle] === LoadStatus.Loading; }
+  isLoaded(handle: AssetHandle): boolean { return this.isValid(handle) && this._status[handleIndex(handle)] === LoadStatus.Loaded; }
+  isLoading(handle: AssetHandle): boolean { return this.isValid(handle) && this._status[handleIndex(handle)] === LoadStatus.Loading; }
 
   getHandleById(id: AssetId): AssetHandle {
-    const slot = this.idToSlot.get(id);
-    return slot !== undefined ? slot as AssetHandle : INVALID_ASSET;
+    const handle = this.idToHandle.get(id);
+    return handle !== undefined ? handle : INVALID_ASSET;
   }
 
   getHandleByPath(path: string): AssetHandle {
@@ -112,54 +150,59 @@ export class AssetStore {
     return this.getHandleById(id);
   }
 
-  has(id: AssetId): boolean { return this.idToSlot.has(id); }
+  has(id: AssetId): boolean { return this.idToHandle.has(id); }
 
   forEachLoaded(callback: (handle: AssetHandle, data: any) => void): void {
-    for (let i = 0; i < this.count; i++) {
-      if (this._status[i] === LoadStatus.Loaded && this._data[i] !== null) {
-        callback(i as AssetHandle, this._data[i]);
+    this.idToHandle.forEach((handle) => {
+      const slot = handleIndex(handle);
+      if (this._status[slot] === LoadStatus.Loaded && this._data[slot] !== null) {
+        callback(handle, this._data[slot]);
       }
-    }
+    });
   }
 
-  get activeCount(): number { return this.count - this.freeList.length; }
+  get activeCount(): number { return this.allocator.activeCount; }
 
   remove(handle: AssetHandle): any {
-    const data = this._data[handle];
-    const id = this._ids[handle];
-    const path = this._paths[handle];
+    if (!this.isValid(handle)) return null;
+    const slot = handleIndex(handle);
+    const data = this._data[slot];
+    const id = this._ids[slot];
+    const path = this._paths[slot];
 
-    this._ids[handle] = "";
-    this._types[handle] = 0;
-    this._status[handle] = LoadStatus.Unloaded;
-    this._refCount[handle] = 0;
-    this._paths[handle] = "";
-    this._data[handle] = null;
-    this._dependencies[handle] = [];
-    this._errors[handle] = null;
+    this._ids[slot] = "";
+    this._types[slot] = 0;
+    this._status[slot] = LoadStatus.Unloaded;
+    this._refCount[slot] = 0;
+    this._paths[slot] = "";
+    this._data[slot] = null;
+    this._dependencies[slot] = [];
+    this._errors[slot] = null;
+    this._memorySize[slot] = 0;
 
-    this.idToSlot.delete(id);
+    this.idToHandle.delete(id);
     this.pathToId.delete(path);
-    this.freeList.push(handle);
+    // Bumps this slot's generation so any handle copy still held elsewhere (e.g. an in-flight
+    // load's closure) fails isValid() from here on, rather than aliasing whatever gets
+    // allocated into this slot next.
+    this.allocator.free(handle);
 
     return data;
   }
 
-  private allocSlot(): number {
-    if (this.freeList.length > 0) return this.freeList.pop()!;
-    if (this.count >= this.capacity) this.grow();
-    return this.count++;
-  }
+  private grow(minCapacity: number): void {
+    let newCap = this.capacity * 2;
+    while (newCap < minCapacity) newCap *= 2;
 
-  private grow(): void {
-    const newCap = this.capacity * 2;
     const newTypes = new Uint8Array(newCap); newTypes.set(this._types);
     const newStatus = new Uint8Array(newCap); newStatus.set(this._status);
     const newRef = new Uint32Array(newCap); newRef.set(this._refCount);
+    const newMemorySize = new Float64Array(newCap); newMemorySize.set(this._memorySize);
 
     this._types = newTypes;
     this._status = newStatus;
     this._refCount = newRef;
+    this._memorySize = newMemorySize;
     this._ids.length = newCap;
     this._paths.length = newCap;
     this._data.length = newCap;

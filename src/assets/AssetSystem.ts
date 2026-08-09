@@ -3,12 +3,44 @@ import { System } from "../ecs";
 import { AssetStore } from "./AssetStore";
 import { AssetId, AssetType, AssetHandle, LoadStatus, INVALID_ASSET } from "./AssetTypes";
 import { EventBus } from "../core/EventBus";
+import { MemoryBudget } from "../core/MemoryBudget";
+import { ResourceType } from "../core/handles/Handle";
+
+// AssetType and ResourceType are separate enums with different numeric values for the same
+// concepts (see AssetTypes.ts / core/handles/Handle.ts) -- this is the only place that needs
+// to translate between them, for feeding load-time byte estimates into MemoryBudget.
+function toResourceType(type: AssetType): ResourceType | null {
+  switch (type) {
+    case AssetType.Texture: return ResourceType.Texture;
+    case AssetType.Mesh: return ResourceType.Mesh;
+    case AssetType.Material: return ResourceType.Material;
+    case AssetType.Audio: return ResourceType.Audio;
+    case AssetType.AnimationClip: return ResourceType.AnimClip;
+    default: return null; // GLTF/Prefab/Scene are containers, not GPU resources themselves
+  }
+}
+
+function estimateTextureBytes(tex: THREE.Texture): number {
+  const img = tex.image as { width?: number; height?: number } | undefined;
+  const w = img?.width ?? 0, h = img?.height ?? 0;
+  // RGBA8 plus ~33% headroom for mipmaps, matching the same rule of thumb ResourceManager
+  // uses elsewhere in the engine for GPU texture memory estimates.
+  return Math.round(w * h * 4 * 1.33);
+}
+
+function estimateAudioBytes(buf: AudioBuffer): number {
+  return buf.length * buf.numberOfChannels * 4;
+}
 
 export class AssetSystem extends System {
   priority = -10;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "prePhysics";
 
   readonly store = new AssetStore();
+  // AUDIT FIX: trackAllocation/trackDeallocation previously had no caller anywhere outside
+  // tests -- the real streaming path (load()/release() below) never fed it, so isOverBudget()
+  // could never actually fire and nothing enforced a memory ceiling during streaming.
+  readonly memoryBudget = new MemoryBudget();
   private textureLoader = new THREE.TextureLoader();
   private audioLoader = new THREE.AudioLoader();
   private loadQueue: AssetHandle[] = [];
@@ -129,6 +161,14 @@ export class AssetSystem extends System {
     if (shouldDispose) {
       const data = this.store.getData(handle);
       if (data?.dispose) data.dispose();
+
+      // Read type/size before remove() clears them below.
+      const resourceType = toResourceType(this.store.getType(handle));
+      const bytes = this.store.getMemorySize(handle);
+      if (resourceType !== null && bytes > 0) {
+        this.memoryBudget.trackDeallocation(resourceType, bytes);
+      }
+
       // Dependencies (e.g. a GLTF's registered meshes/materials/animations) were each
       // retained once when this asset was loaded — release them symmetrically so their own
       // refcounts can drop to zero and they get disposed too, instead of leaking forever.
@@ -155,6 +195,12 @@ export class AssetSystem extends System {
         path,
         (tex) => {
           this.store.setLoaded(handle, tex);
+          const bytes = estimateTextureBytes(tex);
+          this.store.setMemorySize(handle, bytes);
+          this.memoryBudget.trackAllocation(ResourceType.Texture, bytes);
+          if (this.memoryBudget.isOverBudget(ResourceType.Texture)) {
+            console.warn(`[AGEE] Texture memory budget exceeded after loading "${path}" (${(this.memoryBudget.getUsage(ResourceType.Texture) / 1024 / 1024).toFixed(1)}MB used).`);
+          }
           this.events?.emit("asset:loaded", handle);
           resolve(tex);
         },
@@ -174,6 +220,12 @@ export class AssetSystem extends System {
         path,
         (buf) => {
           this.store.setLoaded(handle, buf);
+          const bytes = estimateAudioBytes(buf);
+          this.store.setMemorySize(handle, bytes);
+          this.memoryBudget.trackAllocation(ResourceType.Audio, bytes);
+          if (this.memoryBudget.isOverBudget(ResourceType.Audio)) {
+            console.warn(`[AGEE] Audio memory budget exceeded after loading "${path}" (${(this.memoryBudget.getUsage(ResourceType.Audio) / 1024 / 1024).toFixed(1)}MB used).`);
+          }
           this.events?.emit("asset:loaded", handle);
           resolve(buf);
         },

@@ -60,6 +60,16 @@ export class SceneManager extends System {
       handle.entityIds = this.serializer.deserialize(this.world, data);
     }
 
+    if (this.scenes.get(name) !== handle) {
+      // unloadScene() ran while this load was in flight and dropped our handle from
+      // this.scenes; the entities just deserialized would otherwise be orphaned.
+      for (const eid of handle.entityIds) {
+        this.world.destroyEntity(eid);
+      }
+      handle.entityIds.length = 0;
+      return handle;
+    }
+
     handle.state = "active";
     this.events?.emit("scene:loaded", name);
     return handle;

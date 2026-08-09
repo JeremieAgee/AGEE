@@ -1,12 +1,13 @@
 import { ArchetypeIndex } from "./ArchetypeIndex";
+import { Mask } from "./ComponentMask";
 
 export class Query {
   private archetypes: ArchetypeIndex;
-  private mask: bigint;
+  private mask: Mask;
   private cachedEntities: number[] = [];
   private cachedVersion = -1;
 
-  constructor(archetypes: ArchetypeIndex, mask: bigint) {
+  constructor(archetypes: ArchetypeIndex, mask: Mask) {
     this.archetypes = archetypes;
     this.mask = mask;
   }

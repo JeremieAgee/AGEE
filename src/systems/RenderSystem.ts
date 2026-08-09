@@ -1,11 +1,10 @@
 import * as THREE from "three";
-import { WebGPURenderer } from "three/webgpu";
 import { System, World } from "../ecs";
 import { Transform, MeshRenderer } from "../core/Components";
 import { ComponentStore } from "../ecs";
 
 export type RenderBackend = "webgl" | "webgpu";
-export type AGRenderer = THREE.WebGLRenderer | WebGPURenderer;
+export type AGRenderer = THREE.WebGLRenderer;
 
 export class RenderSystem extends System {
   priority = 900;
@@ -25,38 +24,40 @@ export class RenderSystem extends System {
   private meshStore!: ComponentStore;
   private query!: ReturnType<World["query"]>;
   private postProcessActive = false;
-  // GPURenderSystem (WebGPU-native) is the active opaque-geometry draw path. This system's
-  // canvas renders transparent on top of it as a compositing overlay, so anything not yet
-  // migrated to the native path (particles, world-space UI, debug wireframes) still shows up;
-  // meshes that GLTFPipeline has handed to the GPU path get MeshRenderer.skipThreeDraw=1 so
-  // CullingSystem forces mesh.visible=false for them without touching the shared `visible`
-  // flag GPUMeshRenderer visibility is computed from. `active` is a manual kill-switch for
-  // the overlay pass itself.
+  // GPURenderSystem (WebGPU-native) is the active opaque-geometry draw path — a fully custom
+  // pipeline built directly on navigator.gpu (see gpu/GPUContext.ts), with no dependency on
+  // THREE.js at all. This system's canvas is only a transparent compositing overlay on top of
+  // it, for anything not yet migrated to the native path (particles, world-space UI, debug
+  // wireframes) — meshes that GLTFPipeline has handed to the GPU path get
+  // MeshRenderer.skipThreeDraw=1 so CullingSystem forces mesh.visible=false for them without
+  // touching the shared `visible` flag GPUMeshRenderer visibility is computed from.
+  //
+  // The overlay always renders through THREE.WebGLRenderer (regular "three"), never
+  // three/webgpu's WebGPURenderer, even when `renderBackend: "webgpu"` is requested: "three"
+  // and "three/webgpu" are separate module instances with separate class hierarchies (THREE
+  // itself warns "Multiple instances of Three.js being imported" when both load), so a
+  // THREE.Light/THREE.Mesh built anywhere else in the engine via plain "three" (LightingHelpers,
+  // GLTFPipeline, CullingSystem, every example) fails WebGPURenderer's internal instanceof
+  // checks — it doesn't recognize them as lights or meshes at all, so nothing renders and no
+  // light reaches the scene. `renderBackend` is kept as a config option (and reported via
+  // `requestedBackend`) purely for API compatibility; real WebGPU rendering is what
+  // GPURenderSystem already provides, unconditionally, independent of this setting.
   active = true;
 
   constructor(canvas?: HTMLCanvasElement, backend: RenderBackend = "webgpu") {
     super();
     this.requestedBackend = backend;
+    this.backend = "webgl";
 
-    const useWebGPU = backend === "webgpu" && "gpu" in navigator;
-    this.backend = useWebGPU ? "webgpu" : "webgl";
-    this.renderer = useWebGPU
-      ? new WebGPURenderer({ canvas, antialias: true, alpha: true })
-      : new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     this.renderer.setClearColor(new THREE.Color(0x000000), 0);
 
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.0;
-
-    if (useWebGPU) {
-      this.renderer.shadowMap.enabled = true;
-      this.renderer.shadowMap.type = THREE.BasicShadowMap;
-    } else {
-      this.renderer.shadowMap.enabled = true;
-      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    }
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     if (!canvas) {
       document.body.appendChild(this.renderer.domElement);
@@ -72,13 +73,7 @@ export class RenderSystem extends System {
     this.camera.lookAt(0, 0, 0);
 
     window.addEventListener("resize", this.onResize);
-    this.ready = this.initRenderer();
-  }
-
-  private async initRenderer(): Promise<void> {
-    if (this.backend === "webgpu") {
-      await (this.renderer as WebGPURenderer).init();
-    }
+    this.ready = Promise.resolve();
   }
 
   init(): void {

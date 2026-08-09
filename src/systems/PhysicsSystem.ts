@@ -3,6 +3,7 @@ import RAPIER from "@dimforge/rapier3d-compat";
 import { System, World, ComponentStore } from "../ecs";
 import { Transform, RigidBody, Collider, MeshRenderer, Velocity } from "../core/Components";
 import { Quat } from "../core/math/Quat";
+import { dmax, dquaternionToEuler, deulerToQuaternion } from "../core/DeterministicMath";
 
 export interface RaycastHit {
   entityId: number;
@@ -418,9 +419,9 @@ export class PhysicsSystem extends System {
     }
 
     this.autoBounds.getSize(this.autoSize);
-    const halfX = Math.max(this.autoSize.x * 0.5, 0.01);
-    const halfY = Math.max(this.autoSize.y * 0.5, 0.01);
-    const halfZ = Math.max(this.autoSize.z * 0.5, 0.01);
+    const halfX = dmax(this.autoSize.x * 0.5, 0.01);
+    const halfY = dmax(this.autoSize.y * 0.5, 0.01);
+    const halfZ = dmax(this.autoSize.z * 0.5, 0.01);
 
     return { halfX, halfY, halfZ };
   }
@@ -783,7 +784,7 @@ export class PhysicsSystem extends System {
 
       if (body.isKinematic() && !this.controllers[eid]) {
         body.setNextKinematicTranslation({ x: tx[eid], y: ty[eid], z: tz[eid] });
-        const rot = eulerToQuaternion(trx[eid], trY[eid], trz[eid]);
+        const rot = deulerToQuaternion(trx[eid], trY[eid], trz[eid]);
         body.setNextKinematicRotation(rot);
       }
     }
@@ -891,7 +892,7 @@ export class PhysicsSystem extends System {
       this._tmpPrevQuat.set(this.prevRotX[eid], this.prevRotY[eid], this.prevRotZ[eid], this.prevRotW[eid]);
       this._tmpCurrQuat.set(this.currRotX[eid], this.currRotY[eid], this.currRotZ[eid], this.currRotW[eid]);
       this._tmpPrevQuat.slerp(this._tmpCurrQuat, a);
-      quaternionToEuler(this._tmpPrevQuat.x, this._tmpPrevQuat.y, this._tmpPrevQuat.z, this._tmpPrevQuat.w, eulerOut);
+      dquaternionToEuler(this._tmpPrevQuat.x, this._tmpPrevQuat.y, this._tmpPrevQuat.z, this._tmpPrevQuat.w, eulerOut);
       trx[eid] = eulerOut[0];
       trY[eid] = eulerOut[1];
       trz[eid] = eulerOut[2];
@@ -918,33 +919,3 @@ export class PhysicsSystem extends System {
 }
 
 const eulerOut = new Float32Array(3);
-
-function quaternionToEuler(
-  qx: number, qy: number, qz: number, qw: number,
-  out: Float32Array
-): void {
-  const sinrCosp = 2 * (qw * qx + qy * qz);
-  const cosrCosp = 1 - 2 * (qx * qx + qy * qy);
-  out[0] = Math.atan2(sinrCosp, cosrCosp);
-
-  const sinp = 2 * (qw * qy - qz * qx);
-  out[1] = Math.abs(sinp) >= 1 ? Math.sign(sinp) * (Math.PI / 2) : Math.asin(sinp);
-
-  const sinyCosp = 2 * (qw * qz + qx * qy);
-  const cosyCosp = 1 - 2 * (qy * qy + qz * qz);
-  out[2] = Math.atan2(sinyCosp, cosyCosp);
-}
-
-function eulerToQuaternion(
-  rx: number, ry: number, rz: number
-): { x: number; y: number; z: number; w: number } {
-  const cx = Math.cos(rx * 0.5), sx = Math.sin(rx * 0.5);
-  const cy = Math.cos(ry * 0.5), sy = Math.sin(ry * 0.5);
-  const cz = Math.cos(rz * 0.5), sz = Math.sin(rz * 0.5);
-  return {
-    x: sx * cy * cz - cx * sy * sz,
-    y: cx * sy * cz + sx * cy * sz,
-    z: cx * cy * sz - sx * sy * cz,
-    w: cx * cy * cz + sx * sy * sz,
-  };
-}

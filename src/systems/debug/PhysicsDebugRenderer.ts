@@ -2,6 +2,13 @@ import * as THREE from "three";
 import { System } from "../../ecs";
 import { PhysicsSystem } from "../PhysicsSystem";
 
+// Rapier's debugRender() output size varies frame to frame with the live collider/joint
+// count, unlike DebugDraw's fixed MAX_LINES budget — so instead of a fixed cap, the
+// position/color attributes start at this size and only reallocate (doubling) when a
+// frame's data actually exceeds current capacity; the common case is a plain .set() into
+// the existing typed array.
+const INITIAL_VERTEX_CAPACITY = 4096;
+
 export class PhysicsDebugRenderer extends System {
   priority = 850;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "render";
@@ -11,11 +18,22 @@ export class PhysicsDebugRenderer extends System {
   private physics!: PhysicsSystem;
   private debugVisible = false;
 
+  private positionAttr!: THREE.BufferAttribute;
+  private colorAttr!: THREE.BufferAttribute;
+
   setup(scene: THREE.Scene, physics: PhysicsSystem): void {
     this.scene = scene;
     this.physics = physics;
 
     const geo = new THREE.BufferGeometry();
+    this.positionAttr = new THREE.BufferAttribute(new Float32Array(INITIAL_VERTEX_CAPACITY * 3), 3);
+    this.colorAttr = new THREE.BufferAttribute(new Float32Array(INITIAL_VERTEX_CAPACITY * 4), 4);
+    this.positionAttr.setUsage(THREE.DynamicDrawUsage);
+    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("position", this.positionAttr);
+    geo.setAttribute("color", this.colorAttr);
+    geo.setDrawRange(0, 0);
+
     const mat = new THREE.LineBasicMaterial({
       color: 0x00ff00,
       vertexColors: true,
@@ -48,10 +66,27 @@ export class PhysicsDebugRenderer extends System {
     const colors = buffers.colors;
 
     const geo = this.mesh.geometry;
-    geo.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
-    geo.setAttribute("color", new THREE.BufferAttribute(colors, 4));
-    geo.attributes.position.needsUpdate = true;
-    geo.attributes.color.needsUpdate = true;
+
+    if (vertices.length > this.positionAttr.array.length) {
+      this.positionAttr = new THREE.BufferAttribute(
+        new Float32Array(Math.max(vertices.length, this.positionAttr.array.length * 2)), 3
+      );
+      this.positionAttr.setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute("position", this.positionAttr);
+    }
+    if (colors.length > this.colorAttr.array.length) {
+      this.colorAttr = new THREE.BufferAttribute(
+        new Float32Array(Math.max(colors.length, this.colorAttr.array.length * 2)), 4
+      );
+      this.colorAttr.setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute("color", this.colorAttr);
+    }
+
+    (this.positionAttr.array as Float32Array).set(vertices);
+    (this.colorAttr.array as Float32Array).set(colors);
+    this.positionAttr.needsUpdate = true;
+    this.colorAttr.needsUpdate = true;
+    geo.setDrawRange(0, vertices.length / 3);
   }
 
   destroy(): void {

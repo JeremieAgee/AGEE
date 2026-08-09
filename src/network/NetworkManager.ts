@@ -3,7 +3,8 @@ import { ComponentDef } from "../ecs/Component";
 import { Transform, Velocity } from "../core/Components";
 import { Transport } from "./transport/Transport";
 import { WebSocketTransport } from "./transport/WebSocketTransport";
-import { ComponentRegistry, ActionRegistry } from "./NetworkProtocol";
+import { ComponentRegistry, ActionRegistry, writeConnectAck } from "./NetworkProtocol";
+import { BinaryWriter } from "../core/serialization/BinaryBuffer";
 import { SnapshotManager } from "./SnapshotManager";
 import { InputBuffer } from "./InputBuffer";
 import { InterestManager } from "./InterestManager";
@@ -45,6 +46,7 @@ export class NetworkManager {
   // readConnect carry the token over the wire; the host game's own connection-accept code is
   // expected to read it off the first message on a new transport and pass it into addClient().
   private authValidator: ((clientId: number, token: string) => boolean) | null = null;
+  private connectAckWriter = new BinaryWriter(16);
 
   constructor(world: World, config: NetworkConfig) {
     this.world = world;
@@ -110,6 +112,27 @@ export class NetworkManager {
     // map, so it kept getting sent snapshots on a dead transport forever. Route it through the
     // same removeClient() path addClient()'s counterpart already uses.
     this.receiveSystem.onClientDisconnected = (clientId) => this.removeClient(clientId);
+
+    // AUDIT FIX: the wire-level Connect handshake (writeConnect/readConnect) previously had no
+    // server-side handler at all -- a client's self-reported token never reached auth here, and
+    // ConnectAck (which sets the client's localClientId) was never sent by anything. This runs
+    // the same authValidator addClient() uses, but against the token the client actually sent
+    // over the wire rather than one host code had to intercept and pass into addClient() itself.
+    this.receiveSystem.onConnectRequest = (token, transport, clientId) => {
+      if (this.authValidator && !this.authValidator(clientId, token)) {
+        console.warn(`[Network] Rejecting client ${clientId}: auth validator declined the connection`);
+        transport.disconnect();
+        this.removeClient(clientId);
+        return;
+      }
+      this.sendConnectAck(clientId, transport);
+    };
+  }
+
+  private sendConnectAck(clientId: number, transport: Transport): void {
+    this.connectAckWriter.reset();
+    writeConnectAck(this.connectAckWriter, clientId, this.sendSystem.currentTick);
+    transport.send(this.connectAckWriter.toArrayBuffer());
   }
 
   init(): void {
@@ -125,7 +148,11 @@ export class NetworkManager {
     }
   }
 
-  connect(url: string): void {
+  /** `token` is sent as part of the Connect handshake once the transport connects (see
+   *  NetworkReceiveSystem's "connected" dispatch) — the server-side counterpart of
+   *  setAuthValidator()/addClient()'s token check. */
+  connect(url: string, token: string = ""): void {
+    this.receiveSystem.localConnectToken = token;
     this.transport.connect(url);
   }
 
@@ -179,6 +206,12 @@ export class NetworkManager {
     }
     this.sendSystem.addClient(clientId, clientTransport);
     this.receiveSystem.addClientTransport(clientId, clientTransport);
+    // AUDIT FIX: writeConnectAck() previously had zero call sites -- a client's localClientId
+    // (set by NetworkReceiveSystem's ConnectAck handler) stayed -1 forever unless a game bypassed
+    // this layer entirely to send its own. Sending it here means host code accepting a connection
+    // and calling addClient() with a token it already validated out-of-band doesn't also have to
+    // wait for the wire-level Connect message (see onConnectRequest above) to get acknowledged.
+    this.sendConnectAck(clientId, clientTransport);
     return true;
   }
 

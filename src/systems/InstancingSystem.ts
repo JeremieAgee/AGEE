@@ -26,6 +26,10 @@ export class InstancingSystem extends System {
   private groupMaterials: (THREE.Material | null)[];
   private groupMeshes: (THREE.InstancedMesh | null)[];
   private groupEntities: number[][];
+  // Mirrors groupEntities: entity id -> its index within that group's array, so
+  // add/remove/reorder and the per-frame dirty-entity lookup are all O(1) instead of
+  // scanning the group with indexOf().
+  private groupEntityIndex: Map<number, number>[];
   private groupCapacities: Int32Array;
   private groupDirty: Uint8Array;
   private groupCount = 0;
@@ -44,6 +48,7 @@ export class InstancingSystem extends System {
     this.groupMaterials = new Array(MAX_GROUPS).fill(null);
     this.groupMeshes = new Array(MAX_GROUPS).fill(null);
     this.groupEntities = new Array(MAX_GROUPS).fill(null).map(() => []);
+    this.groupEntityIndex = new Array(MAX_GROUPS).fill(null).map(() => new Map());
     this.groupCapacities = new Int32Array(MAX_GROUPS);
     this.groupDirty = new Uint8Array(MAX_GROUPS);
     this.groupFullRebuild = new Uint8Array(MAX_GROUPS);
@@ -86,10 +91,11 @@ export class InstancingSystem extends System {
   addToGroup(eid: number, groupId: number): void {
     if (groupId >= this.groupCount) return;
 
-    this.groupEntities[groupId].push(eid);
+    const entities = this.groupEntities[groupId];
+    this.groupEntityIndex[groupId].set(eid, entities.length);
+    entities.push(eid);
     this.world.addComponent(eid, InstancedTag, { groupId });
 
-    const entities = this.groupEntities[groupId];
     if (entities.length > this.groupCapacities[groupId]) {
       this.growGroup(groupId);
     }
@@ -102,10 +108,15 @@ export class InstancingSystem extends System {
   removeFromGroup(eid: number, groupId: number): void {
     if (groupId >= this.groupCount) return;
     const entities = this.groupEntities[groupId];
-    const idx = entities.indexOf(eid);
-    if (idx !== -1) {
-      entities[idx] = entities[entities.length - 1];
+    const indexMap = this.groupEntityIndex[groupId];
+    const idx = indexMap.get(eid);
+    if (idx !== undefined) {
+      const lastEid = entities[entities.length - 1];
+      entities[idx] = lastEid;
       entities.pop();
+      indexMap.delete(eid);
+      if (lastEid !== eid) indexMap.set(lastEid, idx);
+
       this.groupMeshes[groupId]!.count = entities.length;
       this.groupFullRebuild[groupId] = 1;
       this.groupDirty[groupId] = 1;
@@ -196,9 +207,10 @@ export class InstancingSystem extends System {
       } else {
         // Sparse update: only update dirty entities
         const dirtySet = this.entityDirty[g];
+        const indexMap = this.groupEntityIndex[g];
         for (const eid of dirtySet) {
-          const idx = entities.indexOf(eid);
-          if (idx !== -1) {
+          const idx = indexMap.get(eid);
+          if (idx !== undefined) {
             this.writeMatrix(mesh, idx, eid, tx, ty, tz, trx, trY, trz, tsx, tsy, tsz);
           }
         }
@@ -233,6 +245,7 @@ export class InstancingSystem extends System {
     this.groupGeometries[groupId] = null;
     this.groupMaterials[groupId] = null;
     this.groupEntities[groupId] = [];
+    this.groupEntityIndex[groupId]?.clear();
     this.entityDirty[groupId]?.clear();
   }
 

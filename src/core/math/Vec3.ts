@@ -1,3 +1,5 @@
+import { dsqrt, dabs } from "../DeterministicMath";
+
 export class Vec3 {
   constructor(public x = 0, public y = 0, public z = 0) {}
 
@@ -47,7 +49,7 @@ export class Vec3 {
   }
 
   length(): number {
-    return Math.sqrt(this.lengthSq());
+    return dsqrt(this.lengthSq());
   }
 
   normalize(): this {
@@ -58,7 +60,7 @@ export class Vec3 {
 
   distanceTo(v: Vec3): number {
     const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z;
-    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    return dsqrt(dx * dx + dy * dy + dz * dz);
   }
 
   distanceToSq(v: Vec3): number {
@@ -74,9 +76,9 @@ export class Vec3 {
   }
 
   equals(v: Vec3, epsilon = 1e-6): boolean {
-    return Math.abs(this.x - v.x) < epsilon &&
-           Math.abs(this.y - v.y) < epsilon &&
-           Math.abs(this.z - v.z) < epsilon;
+    return dabs(this.x - v.x) < epsilon &&
+           dabs(this.y - v.y) < epsilon &&
+           dabs(this.z - v.z) < epsilon;
   }
 
   toArray(): [number, number, number] {

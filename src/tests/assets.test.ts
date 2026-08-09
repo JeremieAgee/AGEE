@@ -57,12 +57,21 @@ describe("AssetStore", () => {
     expect(store.getStatus(h)).toBe(LoadStatus.Unloaded);
   });
 
-  it("a freed slot is reused by the next register() call", () => {
+  it("a freed slot's underlying storage is reused, but the new handle is distinct from the old one", () => {
+    // AUDIT: handles carry a generation (see core/handles/Handle.ts) so a stale handle from
+    // before remove() can't alias whatever register() allocates into the same freed slot next —
+    // otherwise a late-arriving callback for the old asset (e.g. an in-flight load that hadn't
+    // settled yet) could silently stomp the new asset's data with the same raw handle value.
     const store = new AssetStore();
     const h1 = store.register("tex:e", AssetType.Texture, "e.png");
     store.remove(h1);
     const h2 = store.register("tex:f", AssetType.Texture, "f.png");
-    expect(h2).toBe(h1);
+    expect(h2).not.toBe(h1);
+
+    // The old handle must now be recognized as stale rather than reading the new asset's data.
+    store.setLoaded(h2, { dispose: () => {} });
+    expect(store.getData(h1)).toBeNull();
+    expect(store.getData(h2)).not.toBeNull();
   });
 });
 

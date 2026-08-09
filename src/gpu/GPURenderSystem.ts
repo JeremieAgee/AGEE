@@ -5,13 +5,14 @@ import { Vec3 } from "../core/math/Vec3";
 import { Quat } from "../core/math/Quat";
 import { GPUContext } from "./GPUContext";
 import { GPUMesh, VERTEX_BUFFER_LAYOUT } from "./GPUMesh";
-import { GPUMaterialPool } from "./GPUMaterialPool";
+import { GPUMaterialPool, type GPUBlendMode } from "./GPUMaterialPool";
 import { createFrameLayouts, type FrameLayouts } from "./BindGroupLayouts";
 import type { Handle } from "../core/handles/Handle";
 import type { HandleMap } from "../core/handles/Handle";
 import type { CameraSystem } from "../camera/CameraSystem";
 import { LightSync } from "./LightSync";
 import forwardOpaqueWGSL from "./shaders/forward_opaque.wgsl?raw";
+import shadowDepthWGSL from "./shaders/shadow_depth.wgsl?raw";
 
 // AUDIT FIX (bug #4): writes an Euler rotation directly into an existing Quat
 // instead of allocating a new one, mirroring Quat.fromEuler's formula exactly.
@@ -36,12 +37,28 @@ const LIGHT_STRIDE = 64;
 const MAX_LIGHTS = 64;
 const LIGHT_INFO_SIZE = 16;
 
+// Single directional-light shadow map. The frustum is a fixed-size ortho box centered on the
+// camera each frame (rather than tracked scene bounds) -- simple and camera-relative, at the
+// cost of shadows outside SHADOW_HALF_EXTENT of the camera not being captured.
+const SHADOW_MAP_SIZE = 2048;
+const SHADOW_HALF_EXTENT = 40;
+const SHADOW_DISTANCE = 60;
+const SHADOW_NEAR = 0.1;
+const SHADOW_UNIFORM_FLOATS = 20; // mat4x4 (16) + params vec4 (4)
+
 interface DrawCall {
   mesh: GPUMesh;
   modelOffset: number;
   materialBindGroup: GPUBindGroup;
   materialKey: number;
+  pipeline: GPURenderPipeline;
+  distance: number;
 }
+
+// WebGPU bakes blend state and face culling into the pipeline object, so a material's blend
+// mode (opaque/alpha/additive) and doubleSided flag select which of these six pre-built
+// pipelines a draw call uses -- there is no per-draw blend/cull toggle available otherwise.
+type PipelineKey = `${GPUBlendMode}:${"back" | "none"}`;
 
 export class GPURenderSystem extends System {
   // AUDIT FIX (bug #6): this used to collide with RenderSystem's priority=900.
@@ -60,7 +77,7 @@ export class GPURenderSystem extends System {
 
   private gpuCtx!: GPUContext;
   private layouts!: FrameLayouts;
-  private pipeline!: GPURenderPipeline;
+  private pipelines = new Map<PipelineKey, GPURenderPipeline>();
 
   private transformStore!: ComponentStore;
   private meshRendererStore!: ComponentStore;
@@ -79,6 +96,21 @@ export class GPURenderSystem extends System {
   private lightData = new Float32Array(MAX_LIGHTS * LIGHT_STRIDE / 4);
   private lightInfoData = new Uint32Array(4);
 
+  private shadowTexture!: GPUTexture;
+  private shadowView!: GPUTextureView;
+  private shadowSampler!: GPUSampler;
+  private shadowUniformBuffer!: GPUBuffer;
+  private shadowUniformData = new Float32Array(SHADOW_UNIFORM_FLOATS);
+  private shadowFrameBindGroup!: GPUBindGroup;
+  private shadowPipeline!: GPURenderPipeline;
+  private readonly shadowViewMat = new Mat4();
+  private readonly shadowProjMat = new Mat4();
+  private readonly shadowViewProjMat = new Mat4();
+  private readonly shadowEye = new Vec3();
+  private readonly shadowUp = new Vec3();
+  private readonly _shadowDir = new Vec3(0, -1, 0);
+  private _hasShadowCaster = false;
+
   readonly viewMatrix = new Mat4();
   readonly projMatrix = new Mat4();
   readonly viewProjMatrix = new Mat4();
@@ -96,6 +128,7 @@ export class GPURenderSystem extends System {
   private _lightCount = 0;
   private _cameraSystem: CameraSystem | null = null;
   private drawList: DrawCall[] = [];
+  private transparentList: DrawCall[] = [];
   private _lightSync: LightSync | null = null;
 
   // Per-entity model/normal matrix cache, keyed by eid. Recomputing a full 4x4 invert() plus a
@@ -150,30 +183,51 @@ export class GPURenderSystem extends System {
       code: forwardOpaqueWGSL,
     });
 
-    this.pipeline = device.createRenderPipeline({
-      label: "AGEE forward opaque",
-      layout: this.layouts.pipelineLayout,
-      vertex: {
-        module: shaderModule,
-        entryPoint: "vs",
-        buffers: [VERTEX_BUFFER_LAYOUT],
+    // fs() outputs premultiplied color (`mapped * alpha, alpha`), so "alpha" blending uses
+    // premultiplied-alpha blend factors, not the more common src-alpha/one-minus-src-alpha pair.
+    const blendStates: Record<GPUBlendMode, GPUBlendState | undefined> = {
+      opaque: undefined,
+      alpha: {
+        color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
       },
-      fragment: {
-        module: shaderModule,
-        entryPoint: "fs",
-        targets: [{ format: this.gpuCtx.format }],
+      additive: {
+        color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+        alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
       },
-      primitive: {
-        topology: "triangle-list",
-        cullMode: "back",
-        frontFace: "ccw",
-      },
-      depthStencil: {
-        format: "depth24plus",
-        depthWriteEnabled: true,
-        depthCompare: "less",
-      },
-    });
+    };
+
+    for (const blend of ["opaque", "alpha", "additive"] as const) {
+      for (const cullMode of ["back", "none"] as const) {
+        const key: PipelineKey = `${blend}:${cullMode}`;
+        this.pipelines.set(key, device.createRenderPipeline({
+          label: `AGEE forward ${key}`,
+          layout: this.layouts.pipelineLayout,
+          vertex: {
+            module: shaderModule,
+            entryPoint: "vs",
+            buffers: [VERTEX_BUFFER_LAYOUT],
+          },
+          fragment: {
+            module: shaderModule,
+            entryPoint: "fs",
+            targets: [{ format: this.gpuCtx.format, blend: blendStates[blend] }],
+          },
+          primitive: {
+            topology: "triangle-list",
+            cullMode,
+            frontFace: "ccw",
+          },
+          depthStencil: {
+            format: "depth24plus",
+            // Blended surfaces don't write depth -- writing depth for a translucent
+            // fragment would let it occlude whatever should still be visible behind it.
+            depthWriteEnabled: blend === "opaque",
+            depthCompare: "less",
+          },
+        }));
+      }
+    }
 
     this.cameraBuffer = device.createBuffer({
       label: "AGEE camera",
@@ -201,6 +255,45 @@ export class GPURenderSystem extends System {
     });
     this.modelData = new Float32Array(modelBufSize / 4);
 
+    this.perObjectBindGroup = device.createBindGroup({
+      label: "AGEE per-object",
+      layout: this.layouts.perObject,
+      entries: [
+        { binding: 0, resource: { buffer: this.modelBuffer, size: MODEL_UNIFORM_SIZE } },
+      ],
+    });
+
+    this.initShadowMap(device);
+  }
+
+  // depth32float (not depth24plus) because it's the one depth format guaranteed sampleable as a
+  // regular texture across WebGPU implementations -- forward_opaque.wgsl's fs() binds this as
+  // texture_depth_2d to PCF-sample it, which depth24plus doesn't universally support.
+  private initShadowMap(device: GPUDevice): void {
+    this.shadowTexture = device.createTexture({
+      label: "AGEE shadow map",
+      size: [SHADOW_MAP_SIZE, SHADOW_MAP_SIZE],
+      format: "depth32float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.shadowView = this.shadowTexture.createView();
+
+    this.shadowSampler = device.createSampler({
+      label: "AGEE shadow sampler",
+      compare: "less",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+    });
+
+    this.shadowUniformBuffer = device.createBuffer({
+      label: "AGEE shadow uniforms",
+      size: SHADOW_UNIFORM_FLOATS * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    // Rebuild perFrameBindGroup now that the layout includes the shadow uniform/texture/sampler.
     this.perFrameBindGroup = device.createBindGroup({
       label: "AGEE per-frame",
       layout: this.layouts.perFrame,
@@ -208,15 +301,45 @@ export class GPURenderSystem extends System {
         { binding: 0, resource: { buffer: this.cameraBuffer } },
         { binding: 1, resource: { buffer: this.lightBuffer } },
         { binding: 2, resource: { buffer: this.lightInfoBuffer } },
+        { binding: 3, resource: { buffer: this.shadowUniformBuffer } },
+        { binding: 4, resource: this.shadowView },
+        { binding: 5, resource: this.shadowSampler },
       ],
     });
 
-    this.perObjectBindGroup = device.createBindGroup({
-      label: "AGEE per-object",
-      layout: this.layouts.perObject,
+    // Shadow depth pass reads the same lightViewProj this buffer's first 64 bytes carry for
+    // the main pass's shadow sampling -- one write, two consumers.
+    this.shadowFrameBindGroup = device.createBindGroup({
+      label: "AGEE shadow frame",
+      layout: this.layouts.shadowFrame,
       entries: [
-        { binding: 0, resource: { buffer: this.modelBuffer, size: MODEL_UNIFORM_SIZE } },
+        { binding: 0, resource: { buffer: this.shadowUniformBuffer, size: 64 } },
       ],
+    });
+
+    const shadowModule = device.createShaderModule({
+      label: "AGEE shadow depth",
+      code: shadowDepthWGSL,
+    });
+
+    this.shadowPipeline = device.createRenderPipeline({
+      label: "AGEE shadow depth",
+      layout: this.layouts.shadowPipelineLayout,
+      vertex: {
+        module: shadowModule,
+        entryPoint: "vs",
+        buffers: [VERTEX_BUFFER_LAYOUT],
+      },
+      primitive: {
+        topology: "triangle-list",
+        cullMode: "back",
+        frontFace: "ccw",
+      },
+      depthStencil: {
+        format: "depth32float",
+        depthWriteEnabled: true,
+        depthCompare: "less",
+      },
     });
   }
 
@@ -246,8 +369,17 @@ export class GPURenderSystem extends System {
     this._lightCount++;
   }
 
-  setDirectionalLight(dirX: number, dirY: number, dirZ: number, r: number, g: number, b: number, intensity: number): void {
-    this.pushLight(0, 0, 0, 0, dirX, dirY, dirZ, r, g, b, intensity, 0, 0, 0, 0);
+  setDirectionalLight(dirX: number, dirY: number, dirZ: number, r: number, g: number, b: number, intensity: number, castShadow: number = 0): void {
+    this.pushLight(0, 0, 0, 0, dirX, dirY, dirZ, r, g, b, intensity, 0, 0, 0, castShadow);
+  }
+
+  // Called by LightSync for the first shadow-casting directional light found each frame.
+  // Only one directional shadow map exists (see SHADOW_MAP_SIZE et al.), so later callers in
+  // the same frame are ignored -- matches how MAX_LIGHTS overflow is handled in pushLight().
+  setDirectionalShadowCaster(dirX: number, dirY: number, dirZ: number): void {
+    if (this._hasShadowCaster) return;
+    this._hasShadowCaster = true;
+    this._shadowDir.set(dirX, dirY, dirZ);
   }
 
   setPointLight(px: number, py: number, pz: number, r: number, g: number, b: number, intensity: number, range: number, castShadow: number): void {
@@ -298,6 +430,7 @@ export class GPURenderSystem extends System {
    * can repopulate it without lights persisting across frames after removal. */
   resetLights(): void {
     this._lightCount = 0;
+    this._hasShadowCaster = false;
   }
 
   update(_dt: number): void {
@@ -336,6 +469,38 @@ export class GPURenderSystem extends System {
       device.queue.writeBuffer(this.lightBuffer, 0, this.lightData, 0, this._lightCount * LIGHT_STRIDE / 4);
     }
 
+    if (this._hasShadowCaster) {
+      // Frustum follows the camera each frame rather than tracking scene bounds -- eye sits
+      // SHADOW_DISTANCE back along the light's travel direction from the camera, looking at it.
+      const dir = this._shadowDir;
+      this.shadowEye.set(
+        this.cameraPosition.x - dir.x * SHADOW_DISTANCE,
+        this.cameraPosition.y - dir.y * SHADOW_DISTANCE,
+        this.cameraPosition.z - dir.z * SHADOW_DISTANCE,
+      );
+      // Avoid a degenerate lookAt when the light points (near-)parallel to the default up axis.
+      this.shadowUp.set(0, 1, 0);
+      if (Math.abs(dir.y) > 0.999) this.shadowUp.set(0, 0, 1);
+
+      this.shadowViewMat.lookAt(this.shadowEye, this.cameraPosition, this.shadowUp);
+      this.shadowProjMat.orthographic(
+        -SHADOW_HALF_EXTENT, SHADOW_HALF_EXTENT,
+        -SHADOW_HALF_EXTENT, SHADOW_HALF_EXTENT,
+        SHADOW_NEAR, SHADOW_DISTANCE * 2,
+      );
+      this.shadowViewProjMat.copy(this.shadowProjMat).multiply(this.shadowViewMat);
+
+      this.shadowUniformData.set(this.shadowViewProjMat.elements, 0);
+      this.shadowUniformData[16] = 1.0; // params.x: shadow caster active
+      this.shadowUniformData[17] = 1.0 / SHADOW_MAP_SIZE; // params.y: PCF texel size
+      device.queue.writeBuffer(this.shadowUniformBuffer, 0, this.shadowUniformData);
+    } else if (this.shadowUniformData[16] !== 0) {
+      // Only re-write when the caster just went away this frame -- flips fs()'s sampleShadow()
+      // back to its always-lit fallback without re-uploading every frame nothing changed.
+      this.shadowUniformData[16] = 0.0;
+      device.queue.writeBuffer(this.shadowUniformBuffer, 0, this.shadowUniformData);
+    }
+
     const tx = this.transformStore.getColumn("x");
     const ty = this.transformStore.getColumn("y");
     const tz = this.transformStore.getColumn("z");
@@ -352,6 +517,7 @@ export class GPURenderSystem extends System {
     const floatsPerSlot = MODEL_UNIFORM_ALIGNMENT / 4;
     let drawCount = 0;
     this.drawList.length = 0;
+    this.transparentList.length = 0;
 
     for (let i = 0; i < entities.length; i++) {
       const eid = entities[i];
@@ -413,13 +579,27 @@ export class GPURenderSystem extends System {
 
       const matHandle = matHandles[eid] as number as Handle;
       const materialBG = this._materialPool.getBindGroup(matHandle) ?? this._materialPool.defaultBindGroup;
+      const matInfo = this._materialPool.getMaterialInfo(matHandle);
+      const blend: GPUBlendMode = matInfo?.blend ?? "opaque";
+      const cullMode: "back" | "none" = matInfo?.doubleSided ? "none" : "back";
+      const pipeline = this.pipelines.get(`${blend}:${cullMode}`)!;
 
-      this.drawList.push({
+      const call: DrawCall = {
         mesh,
         modelOffset: drawCount * MODEL_UNIFORM_ALIGNMENT,
         materialBindGroup: materialBG,
         materialKey: matHandle,
-      });
+        pipeline,
+        distance: 0,
+      };
+
+      if (blend === "opaque") {
+        this.drawList.push(call);
+      } else {
+        const dx = px - this.cameraPosition.x, dy = py - this.cameraPosition.y, dz = pz - this.cameraPosition.z;
+        call.distance = dx * dx + dy * dy + dz * dz;
+        this.transparentList.push(call);
+      }
       drawCount++;
     }
 
@@ -428,12 +608,44 @@ export class GPURenderSystem extends System {
     // zero-draw frame left the prior frame's contents on screen uncleared.
     // Always present/clear; only the draw-specific work below is conditional.
     if (drawCount > 0) {
-      // Sort by material to minimize bind group switches
+      // Opaque: sort by material to minimize bind group switches. Transparent: sort
+      // back-to-front (farthest first) so nearer translucent surfaces blend on top of
+      // farther ones in the correct order.
       this.drawList.sort((a, b) => a.materialKey - b.materialKey);
+      this.transparentList.sort((a, b) => b.distance - a.distance);
       device.queue.writeBuffer(this.modelBuffer, 0, this.modelData, 0, drawCount * floatsPerSlot);
     }
 
     const { encoder, colorView } = this.gpuCtx.beginFrame();
+
+    // Only opaque geometry casts shadows -- alpha/additive surfaces are skipped, matching how
+    // most forward renderers scope shadow casting to keep the depth-only pass cheap.
+    if (this._hasShadowCaster && this.drawList.length > 0) {
+      const shadowPass = encoder.beginRenderPass({
+        label: "AGEE shadow depth",
+        colorAttachments: [],
+        depthStencilAttachment: {
+          view: this.shadowView,
+          depthClearValue: 1.0,
+          depthLoadOp: "clear",
+          depthStoreOp: "store",
+        },
+      });
+      shadowPass.setPipeline(this.shadowPipeline);
+      shadowPass.setBindGroup(0, this.shadowFrameBindGroup);
+      for (let i = 0; i < this.drawList.length; i++) {
+        const { mesh, modelOffset } = this.drawList[i];
+        shadowPass.setBindGroup(1, this.perObjectBindGroup, [modelOffset]);
+        shadowPass.setVertexBuffer(0, mesh.vertexBuffer);
+        if (mesh.indexBuffer) {
+          shadowPass.setIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
+          shadowPass.drawIndexed(mesh.indexCount);
+        } else {
+          shadowPass.draw(mesh.vertexCount);
+        }
+      }
+      shadowPass.end();
+    }
 
     const pass = encoder.beginRenderPass({
       label: "AGEE forward",
@@ -452,27 +664,38 @@ export class GPURenderSystem extends System {
     });
 
     if (drawCount > 0) {
-      pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, this.perFrameBindGroup);
 
+      let currentPipeline: GPURenderPipeline | null = null;
       let currentMaterialKey = -1;
 
-      for (let i = 0; i < this.drawList.length; i++) {
-        const { mesh, modelOffset, materialBindGroup, materialKey } = this.drawList[i];
+      // Opaque first (depth-writing, sorted by material), then transparent back-to-front
+      // (depth-testing but not writing) on top -- the standard forward-rendering split,
+      // since a single pipeline/blend state can't express both in one pass.
+      for (const list of [this.drawList, this.transparentList]) {
+        for (let i = 0; i < list.length; i++) {
+          const { mesh, modelOffset, materialBindGroup, materialKey, pipeline } = list[i];
 
-        if (materialKey !== currentMaterialKey) {
-          pass.setBindGroup(1, materialBindGroup);
-          currentMaterialKey = materialKey;
-        }
+          if (pipeline !== currentPipeline) {
+            pass.setPipeline(pipeline);
+            currentPipeline = pipeline;
+            currentMaterialKey = -1; // bind group 1 must be re-set after any pipeline change
+          }
 
-        pass.setBindGroup(2, this.perObjectBindGroup, [modelOffset]);
-        pass.setVertexBuffer(0, mesh.vertexBuffer);
+          if (materialKey !== currentMaterialKey) {
+            pass.setBindGroup(1, materialBindGroup);
+            currentMaterialKey = materialKey;
+          }
 
-        if (mesh.indexBuffer) {
-          pass.setIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
-          pass.drawIndexed(mesh.indexCount);
-        } else {
-          pass.draw(mesh.vertexCount);
+          pass.setBindGroup(2, this.perObjectBindGroup, [modelOffset]);
+          pass.setVertexBuffer(0, mesh.vertexBuffer);
+
+          if (mesh.indexBuffer) {
+            pass.setIndexBuffer(mesh.indexBuffer, mesh.indexFormat);
+            pass.drawIndexed(mesh.indexCount);
+          } else {
+            pass.draw(mesh.vertexCount);
+          }
         }
       }
     }
@@ -486,6 +709,8 @@ export class GPURenderSystem extends System {
     this.lightBuffer?.destroy();
     this.lightInfoBuffer?.destroy();
     this.modelBuffer?.destroy();
+    this.shadowTexture?.destroy();
+    this.shadowUniformBuffer?.destroy();
     this._materialPool?.dispose();
   }
 }

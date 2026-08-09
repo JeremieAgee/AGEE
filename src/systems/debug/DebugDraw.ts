@@ -270,7 +270,7 @@ export class DebugDraw extends System {
 
         const srcC = i * COLOR_FLOATS_PER_POINT;
         const dstC = writeIdx * COLOR_FLOATS_PER_POINT;
-        for (let j = 0; j < COLOR_FLOATS_PER_POINT; j++) this.pointColors[dstC + j] = this.pointColors[srcP + j];
+        for (let j = 0; j < COLOR_FLOATS_PER_POINT; j++) this.pointColors[dstC + j] = this.pointColors[srcC + j];
 
         this.pointLifetimes[writeIdx] = this.pointLifetimes[i];
       }

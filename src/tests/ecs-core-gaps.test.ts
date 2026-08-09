@@ -7,11 +7,13 @@ import { BitSet } from "../ecs/BitSet";
 import { SparseSet } from "../ecs/SparseSet";
 import { ArchetypeIndex } from "../ecs/ArchetypeIndex";
 import { Query } from "../ecs/Query";
+import { maskFromBits } from "../ecs/ComponentMask";
 import { defineComponent } from "../ecs/Component";
 import { ComponentStore } from "../ecs/ComponentStore";
 import { CommandBuffer } from "../ecs/CommandBuffer";
 import { World } from "../ecs/World";
-import { Parent } from "../core/HierarchyComponents";
+import { Parent, LocalTransform, WorldTransform, Children } from "../core/HierarchyComponents";
+import { TransformHierarchySystem } from "../systems/TransformHierarchySystem";
 import {
   dsin, dcos, dtan, datan2, dasin, dacos, dsqrt, dabs,
   dmin, dmax, dclamp, dlerp, dfloor, dceil, dround, dfrac, dsign,
@@ -146,13 +148,13 @@ describe("Query filtering semantics", () => {
     const eBoth = 1, eOnlyA = 2, eOnlyB = 3, eNeither = 4;
     for (const e of [eBoth, eOnlyA, eOnlyB, eNeither]) idx.addEntity(e);
 
-    const A = 0b01n, B = 0b10n;
-    idx.setMask(eBoth, A | B);
-    idx.setMask(eOnlyA, A);
-    idx.setMask(eOnlyB, B);
+    const A = maskFromBits(0), B = maskFromBits(1);
+    idx.setMask(eBoth, maskFromBits(0, 1));
+    idx.setMask(eOnlyA, maskFromBits(0));
+    idx.setMask(eOnlyB, maskFromBits(1));
     // eNeither stays at mask 0
 
-    const queryAB = new Query(idx, A | B);
+    const queryAB = new Query(idx, maskFromBits(0, 1));
     expect(new Set(queryAB.entities)).toEqual(new Set([eBoth]));
 
     const queryA = new Query(idx, A);
@@ -461,19 +463,19 @@ describe("DeterministicMath internal correctness", () => {
     }
   });
 
-  // AUDIT: DeterministicMath is internally correct and self-consistent (verified above), but
-  // Vec3.ts/Quat.ts/Mat4.ts never import or call into it — they call native Math.sin/cos/sqrt/
-  // atan2 directly. Confirmed by scanning the actual math source files for any reference to
-  // this module. This means "deterministic" trig/sqrt exists in the codebase but does not
-  // influence any real math path an entity actually goes through — see DeterministicMath.ts.
-  it("AUDIT: Vec3/Quat/Mat4 source never references DeterministicMath (wiring gap, not a correctness bug)", () => {
+  // Vec3.ts/Quat.ts/Mat4.ts route their sin/cos/sqrt/atan2/asin/tan/abs through
+  // DeterministicMath rather than native Math, so simulation-affecting math (physics, AI,
+  // rollback netcode reconciliation) actually gets the determinism guarantee instead of it
+  // sitting unused in DeterministicMath.ts. See also SteeringBehaviors.ts, which routes its
+  // trig/sqrt and its wander RNG (SeededRNG instead of Math.random()) the same way.
+  it("Vec3/Quat/Mat4 source references DeterministicMath", () => {
     const vec3Src = readFileSync(resolve(srcRoot, "core/math/Vec3.ts"), "utf-8");
     const quatSrc = readFileSync(resolve(srcRoot, "core/math/Quat.ts"), "utf-8");
     const mat4Src = readFileSync(resolve(srcRoot, "core/math/Mat4.ts"), "utf-8");
 
-    expect(vec3Src).not.toMatch(/DeterministicMath|from ["'].*DeterministicMath["']/);
-    expect(quatSrc).not.toMatch(/DeterministicMath|from ["'].*DeterministicMath["']/);
-    expect(mat4Src).not.toMatch(/DeterministicMath|from ["'].*DeterministicMath["']/);
+    expect(vec3Src).toMatch(/from ["'].*DeterministicMath["']/);
+    expect(quatSrc).toMatch(/from ["'].*DeterministicMath["']/);
+    expect(mat4Src).toMatch(/from ["'].*DeterministicMath["']/);
   });
 });
 
@@ -711,7 +713,7 @@ describe("AUDIT (bug #6): ArchetypeIndex query-match cache uses one global versi
     idx.addEntity(eX);
     idx.addEntity(eY);
 
-    const maskY = 0b01n; // query only cares about this bit
+    const maskY = maskFromBits(0); // query only cares about this bit
     idx.setMask(eY, maskY);
 
     const queryY = new Query(idx, maskY);
@@ -719,7 +721,7 @@ describe("AUDIT (bug #6): ArchetypeIndex query-match cache uses one global versi
     const versionAfterPriming = idx.version;
 
     // Churn eX's archetype with a completely different bit — has nothing to do with queryY.
-    idx.setMask(eX, 0b10n);
+    idx.setMask(eX, maskFromBits(1));
 
     // AUDIT: setMask() bumps ONE shared `_version` counter regardless of which bits changed
     // (see ArchetypeIndex.ts `this._version++` in setMask/addEntity/removeEntity), so any
@@ -850,5 +852,72 @@ describe("AUDIT (bug #5): SpatialHash (cx,cz) key collisions leak unrelated enti
     const results = grid.queryAABB(posA.x - 1, posA.z - 1, posA.x + 1, posA.z + 1);
     expect(results).toContain(10);
     expect(results).not.toContain(20);
+  });
+});
+
+// ===========================================================================
+// AUDIT (bug #6): TransformHierarchySystem stopped propagating LocalTransform edits after an
+// entity's first frame because markDirty() had no automatic caller anywhere in the engine.
+// ===========================================================================
+describe("AUDIT (bug #6): TransformHierarchySystem detects LocalTransform edits without markDirty()", () => {
+  function makeChild(world: World, parentEid: number): number {
+    const eid = world.createEntity();
+    world.addComponent(eid, LocalTransform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, rw: 1, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(eid, WorldTransform, { dirty: 1 });
+    world.addComponent(eid, Parent, { entity: parentEid, entityGeneration: world.generation(parentEid) });
+    const children = world.getStore(Children).get(parentEid, "entities") as number[];
+    children.push(eid);
+    return eid;
+  }
+
+  it("a direct LocalTransform write on a child, made after its first settled frame, still reaches WorldTransform", () => {
+    const world = new World();
+    const sys = new TransformHierarchySystem();
+    world.addSystem(sys);
+
+    const parent = world.createEntity();
+    world.addComponent(parent, LocalTransform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, rw: 1, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(parent, WorldTransform, { dirty: 1 });
+    world.addComponent(parent, Children, { entities: [] });
+
+    const child = makeChild(world, parent);
+
+    // First frame: everything is dirty (fresh spawn), child settles at local x=0 -> world m30=0.
+    sys.update(0);
+    expect(world.getStore(WorldTransform).get(child, "m30")).toBe(0);
+
+    // Move the child directly through its LocalTransform store, the way any gameplay code would
+    // (a weapon socket, a turret head) -- no call to sys.markDirty(child) anywhere, matching how
+    // the engine's own callers actually mutate LocalTransform after spawn.
+    world.getStore(LocalTransform).set(child, "x", 5);
+
+    sys.update(0);
+    expect(world.getStore(WorldTransform).get(child, "m30")).toBe(5);
+  });
+
+  it("moving a mid-hierarchy node still propagates down to its own children", () => {
+    const world = new World();
+    const sys = new TransformHierarchySystem();
+    world.addSystem(sys);
+
+    const root = world.createEntity();
+    world.addComponent(root, LocalTransform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, rw: 1, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(root, WorldTransform, { dirty: 1 });
+    world.addComponent(root, Children, { entities: [] });
+
+    const mid = makeChild(world, root);
+    world.addComponent(mid, Children, { entities: [] });
+    const leaf = makeChild(world, mid);
+
+    sys.update(0);
+    expect(world.getStore(WorldTransform).get(leaf, "m30")).toBe(0);
+
+    // Move the middle node, not the leaf -- the leaf's own LocalTransform never changes, so it
+    // must pick up the new world position purely through parent-dirty propagation.
+    world.getStore(LocalTransform).set(mid, "x", 10);
+
+    sys.update(0);
+    expect(world.getStore(WorldTransform).get(mid, "m30")).toBe(10);
+    expect(world.getStore(WorldTransform).get(leaf, "m30")).toBe(10);
   });
 });

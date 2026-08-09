@@ -28,7 +28,11 @@ export class GameStateManager {
 
   switch(state: GameState): void {
     this.current?.exit();
-    this.stack[this.stack.length - 1] = state;
+    if (this.stack.length > 0) {
+      this.stack[this.stack.length - 1] = state;
+    } else {
+      this.stack.push(state);
+    }
     state.enter();
   }
 

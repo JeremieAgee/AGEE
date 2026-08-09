@@ -1,7 +1,7 @@
-const PI = 3.14159265358979323846;
-const TWO_PI = 6.28318530717958647692;
-const HALF_PI = 1.57079632679489661923;
-const INV_PI = 0.31830988618379067154;
+export const PI = 3.14159265358979323846;
+export const TWO_PI = 6.28318530717958647692;
+export const HALF_PI = 1.57079632679489661923;
+export const INV_PI = 0.31830988618379067154;
 
 const SIN_TABLE_SIZE = 4096;
 const SIN_TABLE_MASK = SIN_TABLE_SIZE - 1;
@@ -57,9 +57,24 @@ export function datan2(y: number, x: number): number {
   return a;
 }
 
-function atanApprox(x: number): number {
+const QUARTER_PI = PI / 4;
+// tan(pi/8), the half-angle reduction threshold below.
+const TAN_PI_8 = 0.4142135623730951;
+
+// atanApprox only needs to be accurate on [0, 1] (datan2 always calls it with a ratio in that
+// range). A single minimax polynomial over the full [0, 1] domain tops out around 6.6e-2 rad
+// error near x=1 — good enough to make DeterministicMath's angle a rough guess, not good enough
+// to round-trip a quaternion through toEuler/fromEuler. Halving the domain via the standard
+// atan(x) = pi/4 + atan((x-1)/(x+1)) identity for x > tan(pi/8) keeps the polynomial's input in
+// [-tan(pi/8), tan(pi/8)], where the same-degree polynomial is accurate to ~1.2e-5 rad.
+function atanPoly(x: number): number {
   const x2 = x * x;
-  return x * (1.0 - x2 * (0.333333333 - x2 * (0.2 - x2 * 0.142857143)));
+  return x * (0.9998660 + x2 * (-0.3302995 + x2 * (0.1801410 + x2 * (-0.0851330 + x2 * 0.0208351))));
+}
+
+function atanApprox(x: number): number {
+  if (x > TAN_PI_8) return QUARTER_PI + atanPoly((x - 1) / (x + 1));
+  return atanPoly(x);
 }
 
 export function dasin(x: number): number {

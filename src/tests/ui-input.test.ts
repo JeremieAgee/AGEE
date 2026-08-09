@@ -176,6 +176,23 @@ describe("UIManager", () => {
     expect(overlay.querySelector("b")).toBeNull();
   });
 
+  // AUDIT: an entity destroyed by anything other than an explicit removeWorldUI(eid) call (e.g.
+  // world.destroyEntity via level streaming) left its <div> and worldUIElements entry behind
+  // forever — UIManager never hooked worldUIStore.onRemove the way AudioSystem hooks its own
+  // store for exactly this reason.
+  it("destroying the entity directly (not via removeWorldUI) still detaches its DOM element", () => {
+    const { overlay, world, uiManager } = makeManager();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 });
+
+    uiManager.createWorldUI(eid, "<b>Boss</b>", 2, 40);
+    expect(overlay.querySelector("b")?.textContent).toBe("Boss");
+
+    world.destroyEntity(eid);
+
+    expect(overlay.querySelector("b")).toBeNull();
+  });
+
   it("update() hides a world-space UI element once the entity exceeds maxDistance", () => {
     const { world, uiManager } = makeManager();
     const eid = world.createEntity();

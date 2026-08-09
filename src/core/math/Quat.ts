@@ -1,4 +1,5 @@
 import { Vec3 } from "./Vec3";
+import { dsqrt, dsin, dcos, datan2, dasin, dacos, dabs, dsign, HALF_PI } from "../DeterministicMath";
 
 export class Quat {
   constructor(public x = 0, public y = 0, public z = 0, public w = 1) {}
@@ -42,7 +43,7 @@ export class Quat {
   }
 
   normalize(): this {
-    const len = Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w);
+    const len = dsqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w);
     if (len > 1e-8) {
       const inv = 1 / len;
       this.x *= inv; this.y *= inv; this.z *= inv; this.w *= inv;
@@ -70,10 +71,10 @@ export class Quat {
 
     let s0: number, s1: number;
     if (1.0 - dot > 1e-6) {
-      const omega = Math.acos(dot);
-      const sinOmega = Math.sin(omega);
-      s0 = Math.sin((1 - t) * omega) / sinOmega;
-      s1 = Math.sin(t * omega) / sinOmega;
+      const omega = dacos(dot);
+      const sinOmega = dsin(omega);
+      s0 = dsin((1 - t) * omega) / sinOmega;
+      s1 = dsin(t * omega) / sinOmega;
     } else {
       s0 = 1 - t;
       s1 = t;
@@ -88,22 +89,22 @@ export class Quat {
   toEuler(): Vec3 {
     const sinrCosp = 2 * (this.w * this.x + this.y * this.z);
     const cosrCosp = 1 - 2 * (this.x * this.x + this.y * this.y);
-    const x = Math.atan2(sinrCosp, cosrCosp);
+    const x = datan2(sinrCosp, cosrCosp);
 
     const sinp = 2 * (this.w * this.y - this.z * this.x);
-    const y = Math.abs(sinp) >= 1 ? Math.sign(sinp) * (Math.PI / 2) : Math.asin(sinp);
+    const y = dabs(sinp) >= 1 ? dsign(sinp) * HALF_PI : dasin(sinp);
 
     const sinyCosp = 2 * (this.w * this.z + this.x * this.y);
     const cosyCosp = 1 - 2 * (this.y * this.y + this.z * this.z);
-    const z = Math.atan2(sinyCosp, cosyCosp);
+    const z = datan2(sinyCosp, cosyCosp);
 
     return new Vec3(x, y, z);
   }
 
   static fromEuler(x: number, y: number, z: number): Quat {
-    const cx = Math.cos(x * 0.5), sx = Math.sin(x * 0.5);
-    const cy = Math.cos(y * 0.5), sy = Math.sin(y * 0.5);
-    const cz = Math.cos(z * 0.5), sz = Math.sin(z * 0.5);
+    const cx = dcos(x * 0.5), sx = dsin(x * 0.5);
+    const cy = dcos(y * 0.5), sy = dsin(y * 0.5);
+    const cz = dcos(z * 0.5), sz = dsin(z * 0.5);
     return new Quat(
       sx * cy * cz - cx * sy * sz,
       cx * sy * cz + sx * cy * sz,
@@ -114,8 +115,8 @@ export class Quat {
 
   static fromAxisAngle(axis: Vec3, angle: number): Quat {
     const half = angle * 0.5;
-    const s = Math.sin(half);
-    return new Quat(axis.x * s, axis.y * s, axis.z * s, Math.cos(half));
+    const s = dsin(half);
+    return new Quat(axis.x * s, axis.y * s, axis.z * s, dcos(half));
   }
 
   toArray(): [number, number, number, number] {

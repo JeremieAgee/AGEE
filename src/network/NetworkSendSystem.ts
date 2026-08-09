@@ -64,6 +64,12 @@ export class NetworkSendSystem extends System {
   private transformStore!: ComponentStore;
   private replicatedStore!: ComponentStore;
 
+  // A congested client (slow network, stalled reader) otherwise gets a snapshot queued every
+  // server tick regardless of whether it's draining them, so its transport's outbound buffer
+  // grows without bound. 64 KiB is a few snapshots' worth of backlog — enough slack to absorb a
+  // brief stall without skipping sends, small enough to catch sustained congestion quickly.
+  private static readonly CONGESTION_THRESHOLD_BYTES = 64 * 1024;
+
   // Network ID to entity mapping (shared reference from receive system)
   private networkIdToEntity: ReadonlyMap<number, number> = new Map();
 
@@ -161,6 +167,18 @@ export class NetworkSendSystem extends System {
     this.snapshotManager.storeSnapshot(fullSnapshot);
 
     for (const [clientId, client] of this.connectedClients) {
+      // Skip this client's send entirely when its transport reports a large amount of
+      // already-queued, unsent data — sending more would just pile onto the backlog. The
+      // client's lastSentSnapshot is left as-is, so once it drains, the next successful send
+      // diffs against the same baseline and simply carries the accumulated changes.
+      const transportWithBuffer = client.transport as unknown as { bufferedAmount?: number };
+      if (
+        typeof transportWithBuffer.bufferedAmount === "number" &&
+        transportWithBuffer.bufferedAmount > NetworkSendSystem.CONGESTION_THRESHOLD_BYTES
+      ) {
+        continue;
+      }
+
       let snapshot = fullSnapshot;
 
       if (this.interestManager) {

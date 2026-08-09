@@ -62,6 +62,16 @@ function hasConflict(a: System, b: System): boolean {
 // SystemScheduler
 // ---------------------------------------------------------------------------
 
+// Builds a dependency-ordered, conflict-free stage plan from each system's declared
+// reads/writes (plus explicit before/after constraints), then executes it sequentially on the
+// main thread. The stage partition is not a concurrency mechanism today: every system here
+// holds live references to the World, Three.js objects, the GPU device, and/or the Rapier WASM
+// instance, none of which can cross a Web Worker boundary without those systems first being
+// restructured into pure, transferable-data kernels — a much larger change than this scheduler.
+// What the partition buys instead: systems within the same stage are provably safe to run in
+// any order (or, if that restructuring ever happens, concurrently) because buildStagesForPhase
+// guarantees no two of them read/write the same component. `execute()` runs them in a plain
+// nested loop deliberately, not as a stand-in for real parallelism.
 export class SystemScheduler {
   private constraints: SystemConstraint[] = [];
   private plan: ExecutionPlan | null = null;
@@ -118,6 +128,9 @@ export class SystemScheduler {
     return this.buildPlan(systems, phaseOrder);
   }
 
+  // Sequential by design — see the class comment above for why stages don't dispatch to
+  // workers. Systems within a stage are conflict-free, so this loop's ordering among them is
+  // arbitrary and safe; it does not need to be (and today cannot safely be) concurrent.
   execute(plan: ExecutionPlan, dt: number): void {
     const p = this.profiler;
     for (const [, stages] of plan.phases) {

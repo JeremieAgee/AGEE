@@ -49,6 +49,12 @@ export class UIManager extends System {
     this.transformStore = this.world.getStore(Transform);
     this.worldUIStore = this.world.getStore(WorldUI);
     this.worldUIQuery = this.world.query(Transform, WorldUI);
+
+    // AUDIT FIX: without this, an entity destroyed by anything other than an explicit
+    // removeWorldUI(eid) call (e.g. World.destroyEntity via SceneManager.unloadScene) left its
+    // appended <div> and worldUIElements entry behind forever — mirrors the onRemove hook
+    // AudioSystem already uses for exactly this reason.
+    this.worldUIStore.onRemove((eid) => this.removeWorldUI(eid));
   }
 
   add(widget: Widget): void {

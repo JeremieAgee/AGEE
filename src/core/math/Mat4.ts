@@ -1,5 +1,6 @@
 import { Vec3 } from "./Vec3";
 import { Quat } from "./Quat";
+import { dsqrt, dtan, dabs } from "../DeterministicMath";
 
 export class Mat4 {
   readonly elements: Float32Array;
@@ -57,9 +58,9 @@ export class Mat4 {
 
   decompose(position: Vec3, rotation: Quat, scale: Vec3): this {
     const e = this.elements;
-    let sx = Math.sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
-    const sy = Math.sqrt(e[4] * e[4] + e[5] * e[5] + e[6] * e[6]);
-    const sz = Math.sqrt(e[8] * e[8] + e[9] * e[9] + e[10] * e[10]);
+    let sx = dsqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+    const sy = dsqrt(e[4] * e[4] + e[5] * e[5] + e[6] * e[6]);
+    const sz = dsqrt(e[8] * e[8] + e[9] * e[9] + e[10] * e[10]);
 
     // Detect mirrored transforms via 3x3 determinant
     const det = e[0] * (e[5] * e[10] - e[6] * e[9])
@@ -77,16 +78,16 @@ export class Mat4 {
 
     const trace = m11 + m22 + m33;
     if (trace > 0) {
-      const s = 0.5 / Math.sqrt(trace + 1);
+      const s = 0.5 / dsqrt(trace + 1);
       rotation.set((m32 - m23) * s, (m13 - m31) * s, (m21 - m12) * s, 0.25 / s);
     } else if (m11 > m22 && m11 > m33) {
-      const s = 2 * Math.sqrt(1 + m11 - m22 - m33);
+      const s = 2 * dsqrt(1 + m11 - m22 - m33);
       rotation.set(0.25 * s, (m12 + m21) / s, (m13 + m31) / s, (m32 - m23) / s);
     } else if (m22 > m33) {
-      const s = 2 * Math.sqrt(1 + m22 - m11 - m33);
+      const s = 2 * dsqrt(1 + m22 - m11 - m33);
       rotation.set((m12 + m21) / s, 0.25 * s, (m23 + m32) / s, (m13 - m31) / s);
     } else {
-      const s = 2 * Math.sqrt(1 + m33 - m11 - m22);
+      const s = 2 * dsqrt(1 + m33 - m11 - m22);
       rotation.set((m13 + m31) / s, (m23 + m32) / s, 0.25 * s, (m21 - m12) / s);
     }
     return this;
@@ -136,7 +137,7 @@ export class Mat4 {
 
   perspective(fovRadians: number, aspect: number, near: number, far: number): this {
     const e = this.elements;
-    const f = 1.0 / Math.tan(fovRadians * 0.5);
+    const f = 1.0 / dtan(fovRadians * 0.5);
     const rangeInv = 1.0 / (near - far);
 
     e.fill(0);
@@ -148,16 +149,31 @@ export class Mat4 {
     return this;
   }
 
+  orthographic(left: number, right: number, bottom: number, top: number, near: number, far: number): this {
+    const e = this.elements;
+    const rangeInv = 1.0 / (near - far);
+
+    e.fill(0);
+    e[0] = 2 / (right - left);
+    e[5] = 2 / (top - bottom);
+    e[10] = rangeInv;
+    e[12] = -(left + right) / (right - left);
+    e[13] = -(bottom + top) / (top - bottom);
+    e[14] = near * rangeInv;
+    e[15] = 1;
+    return this;
+  }
+
   lookAt(eye: Vec3, target: Vec3, up: Vec3): this {
     const e = this.elements;
     let zx = eye.x - target.x, zy = eye.y - target.y, zz = eye.z - target.z;
-    let len = Math.sqrt(zx * zx + zy * zy + zz * zz);
+    let len = dsqrt(zx * zx + zy * zy + zz * zz);
     if (len > 1e-8) { zx /= len; zy /= len; zz /= len; }
 
     let xx = up.y * zz - up.z * zy;
     let xy = up.z * zx - up.x * zz;
     let xz = up.x * zy - up.y * zx;
-    len = Math.sqrt(xx * xx + xy * xy + xz * xz);
+    len = dsqrt(xx * xx + xy * xy + xz * xz);
     if (len > 1e-8) { xx /= len; xy /= len; xz /= len; }
 
     const yx = zy * xz - zz * xy;
@@ -195,7 +211,7 @@ export class Mat4 {
     const b11 = a22 * a33 - a23 * a32;
 
     let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-    if (Math.abs(det) < 1e-12) return this;
+    if (dabs(det) < 1e-12) return this;
     det = 1.0 / det;
 
     e[0]  = (a11 * b11 - a12 * b10 + a13 * b09) * det;

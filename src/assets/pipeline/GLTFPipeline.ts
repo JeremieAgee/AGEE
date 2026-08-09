@@ -10,6 +10,31 @@ import type { GPUMaterialPool } from "../../gpu/GPUMaterialPool";
 import { extractGeometry } from "../../gpu/ThreeGeometryAdapter";
 import { AssetSystem } from "../AssetSystem";
 import { AssetType, AssetHandle, AssetId, INVALID_ASSET } from "../AssetTypes";
+import { ResourceType } from "../../core/handles/Handle";
+
+// THREE.Material property names that may hold a texture map, checked when registering a
+// material's textures as its own AssetStore dependencies (see loadAndRegister). Not exhaustive
+// of every material type's texture slots, but covers what GLTFLoader actually populates on the
+// MeshStandardMaterial/MeshPhysicalMaterial instances it produces.
+const TEXTURE_MAP_KEYS = [
+  "map", "normalMap", "aoMap", "metalnessMap", "roughnessMap", "emissiveMap",
+  "bumpMap", "displacementMap", "alphaMap", "lightMap", "specularMap",
+] as const;
+
+function estimateGeometryBytes(geo: THREE.BufferGeometry): number {
+  let bytes = 0;
+  for (const key in geo.attributes) {
+    bytes += geo.attributes[key].array.byteLength;
+  }
+  if (geo.index) bytes += geo.index.array.byteLength;
+  return bytes;
+}
+
+function estimateTextureBytes(tex: THREE.Texture): number {
+  const img = tex.image as { width?: number; height?: number } | undefined;
+  const w = img?.width ?? 0, h = img?.height ?? 0;
+  return Math.round(w * h * 4 * 1.33); // RGBA8 + ~mip overhead
+}
 
 export interface GLTFAsset {
   meshes: AssetHandle[];
@@ -108,6 +133,7 @@ export class GLTFPipeline {
 
     // Extract and register meshes + materials as separate assets
     const materialCache = new Map<THREE.Material, AssetHandle>();
+    const textureCache = new Map<THREE.Texture, AssetHandle>();
 
     gltf.scene.traverse((node) => {
       if (node.name) result.nodeMap.set(node.name, node);
@@ -121,6 +147,10 @@ export class GLTFPipeline {
         this.assets.store.addDependency(gltfHandle, meshHandle);
         result.meshes.push(meshHandle);
 
+        const meshBytes = estimateGeometryBytes(node.geometry);
+        this.assets.store.setMemorySize(meshHandle, meshBytes);
+        this.assets.memoryBudget.trackAllocation(ResourceType.Mesh, meshBytes);
+
         // Register material(s)
         const mats = Array.isArray(node.material) ? node.material : [node.material];
         for (const mat of mats) {
@@ -132,6 +162,29 @@ export class GLTFPipeline {
             this.assets.store.addDependency(gltfHandle, matHandle);
             materialCache.set(mat, matHandle);
             result.materials.push(matHandle);
+
+            // THREE.Material.dispose() does NOT dispose the textures it references, so without
+            // registering them as the material's own dependencies here, every load/unload cycle
+            // of a textured material leaked its GPU texture memory permanently — nothing else in
+            // the engine ever called .dispose() on these THREE.Texture instances.
+            for (const key of TEXTURE_MAP_KEYS) {
+              const tex = (mat as unknown as Record<string, unknown>)[key];
+              if (!(tex instanceof THREE.Texture)) continue;
+              let texHandle = textureCache.get(tex);
+              if (texHandle === undefined) {
+                const texId = `${id}:tex:${tex.name || tex.uuid}`;
+                texHandle = this.assets.store.register(texId, AssetType.Texture, path);
+                this.assets.store.setLoaded(texHandle, tex);
+                this.assets.store.retain(texHandle);
+                const texBytes = estimateTextureBytes(tex);
+                this.assets.store.setMemorySize(texHandle, texBytes);
+                this.assets.memoryBudget.trackAllocation(ResourceType.Texture, texBytes);
+                textureCache.set(tex, texHandle);
+              } else {
+                this.assets.store.retain(texHandle);
+              }
+              this.assets.store.addDependency(matHandle, texHandle);
+            }
           }
         }
 
@@ -174,7 +227,14 @@ export class GLTFPipeline {
   ): GLTFInstantiateResult {
     const result: GLTFInstantiateResult = { entityIds: [], rootEntity: -1 };
 
-    const rootEid = this.createEntityFromObject(asset.sceneRoot, world, parentScene, result, null);
+    // createEntityFromObject reparents whatever Object3D it's handed (parentScene.add(obj) —
+    // THREE.Object3D.add() removes the child from its previous parent first). Without cloning,
+    // a second instantiate() of the same cached asset.sceneRoot rips its meshes out of the
+    // first instance's scene instead of creating an independent instance. clone(true) shares
+    // geometry/material by reference (the expensive GPU-side data) and only deep-copies the
+    // lightweight Object3D transform hierarchy, so this doesn't duplicate any asset memory.
+    const instanceRoot = asset.sceneRoot.clone(true);
+    const rootEid = this.createEntityFromObject(instanceRoot, world, parentScene, result, null);
     result.rootEntity = rootEid;
 
     if (position && rootEid >= 0) {
@@ -233,6 +293,12 @@ export class GLTFPipeline {
     if (obj instanceof THREE.Mesh) {
       obj.castShadow = true;
       obj.receiveShadow = true;
+      // Geometry/material are shared by reference across every instance cloned from the same
+      // GLTFAsset (see instantiate()) and are owned by the AssetSystem's retain/release cycle
+      // on the GLTF asset itself -- Engine.ts's per-entity destroy cleanup must not dispose()
+      // them, or destroying one instance would free the GPU buffers every other live instance
+      // is still drawing from.
+      obj.userData.assetOwned = true;
       parentScene.add(obj);
 
       // Try to hand this mesh's geometry/material to the GPU-native pipeline. Three.js's
@@ -241,7 +307,13 @@ export class GLTFPipeline {
       // suppress the THREE-side draw without touching `visible` (which stays the shared
       // on/off switch for both the THREE and GPU-native draw paths).
       let gpuAttached = false;
-      if (this.gpuTarget) {
+      // GPUMesh/extractGeometry only ever reads position/normal/uv -- it has no skinIndex/
+      // skinWeight extraction and GPURenderSystem has no bone-palette uniform or vertex
+      // skinning in forward_opaque.wgsl, so a SkinnedMesh uploaded here would render its
+      // static bind pose forever while skipThreeDraw silenced the Three.js AnimationMixer
+      // path that actually animates it. Leaving the Three.js draw path live for skinned
+      // meshes means they keep animating correctly instead of rendering frozen.
+      if (this.gpuTarget && !(obj instanceof THREE.SkinnedMesh)) {
         try {
           const desc = extractGeometry(obj.geometry);
           const gpuMesh = GPUMesh.create(this.gpuTarget.ctx, desc);
@@ -250,10 +322,19 @@ export class GLTFPipeline {
           const srcMat = Array.isArray(obj.material) ? obj.material[0] : obj.material;
           const standard = srcMat as THREE.MeshStandardMaterial | undefined;
           const color = standard?.color ?? { r: 0.8, g: 0.8, b: 0.8 };
+          const blend = standard?.transparent
+            ? (standard.blending === THREE.AdditiveBlending ? "additive" : "alpha")
+            : "opaque";
           const materialHandle = this.gpuTarget.materialPool.create({
             r: color.r, g: color.g, b: color.b,
+            a: standard?.opacity,
             metalness: standard?.metalness,
             roughness: standard?.roughness,
+            blend,
+            doubleSided: standard?.side === THREE.DoubleSide,
+            map: standard?.map?.image ?? null,
+            normalMap: standard?.normalMap?.image ?? null,
+            aoMap: standard?.aoMap?.image ?? null,
           });
 
           world.addComponent(eid, GPUMeshRenderer, {

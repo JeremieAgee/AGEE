@@ -7,6 +7,7 @@ import { ArchetypeIndex } from "./ArchetypeIndex";
 import { SystemScheduler, ExecutionPlan, SystemConstraint } from "./SystemScheduler";
 import type { EngineProfiler } from "../core/EngineProfiler";
 import { Parent } from "../core/HierarchyComponents";
+import { createMask, maskOrBit, maskAndNotBit } from "./ComponentMask";
 
 type EntityCallback = (eid: number) => void;
 
@@ -24,12 +25,14 @@ export const enum EntityFlags {
 export class World {
   private nextEntityId = 0;
   private stores = new Map<string, ComponentStore>();
-  private componentBits = new Map<string, bigint>();
-  private nextComponentBit = 0n;
+  private componentBits = new Map<string, number>();
+  private nextComponentBit = 0;
   private archetypes = new ArchetypeIndex();
   private systems: System[] = [];
   private phaseOrder: SystemPhase[] = ["prePhysics", "physics", "postPhysics", "render"];
   private queries: Query[] = [];
+  private queriesBySystem = new Map<System, Query[]>();
+  private initializingSystem: System | null = null;
   private recycled: number[] = [];
 
   private scheduler = new SystemScheduler();
@@ -240,15 +243,31 @@ export class World {
   }
 
   query(...defs: ComponentDef[]): Query {
-    let mask = 0n;
+    const mask = createMask();
     for (const def of defs) {
       this.getStore(def);
-      mask |= this.getComponentBit(def.name);
+      maskOrBit(mask, this.getComponentBit(def.name), mask);
     }
 
     const q = new Query(this.archetypes, mask);
     this.queries.push(q);
+    if (this.initializingSystem) {
+      let owned = this.queriesBySystem.get(this.initializingSystem);
+      if (!owned) {
+        owned = [];
+        this.queriesBySystem.set(this.initializingSystem, owned);
+      }
+      owned.push(q);
+    }
     return q;
+  }
+
+  // Explicit unregister for queries created outside a System's init() (ad-hoc/editor/test
+  // usage) that would otherwise sit in `queries` forever — see removeSystem() for the
+  // automatic path covering queries a System created during its own init().
+  removeQuery(query: Query): void {
+    const idx = this.queries.indexOf(query);
+    if (idx !== -1) this.queries.splice(idx, 1);
   }
 
   setProfiler(profiler: EngineProfiler): void {
@@ -265,7 +284,14 @@ export class World {
     this.systems.push(system);
     this.systems.sort((a, b) => a.priority - b.priority);
     this.systemsDirty = true;
-    system.init?.();
+
+    const prevInitializing = this.initializingSystem;
+    this.initializingSystem = system;
+    try {
+      system.init?.();
+    } finally {
+      this.initializingSystem = prevInitializing;
+    }
   }
 
   getSystems(): readonly System[] {
@@ -278,6 +304,12 @@ export class World {
       system.destroy?.();
       this.systems.splice(idx, 1);
       this.systemsDirty = true;
+    }
+
+    const owned = this.queriesBySystem.get(system);
+    if (owned) {
+      for (const q of owned) this.removeQuery(q);
+      this.queriesBySystem.delete(system);
     }
   }
 
@@ -296,9 +328,11 @@ export class World {
     this.systems.length = 0;
     this.stores.clear();
     this.componentBits.clear();
-    this.nextComponentBit = 0n;
+    this.nextComponentBit = 0;
     this.archetypes.clear();
     this.queries.length = 0;
+    this.queriesBySystem.clear();
+    this.initializingSystem = null;
     this.nextEntityId = 0;
     this.recycled.length = 0;
     this._alive.clear();
@@ -326,10 +360,10 @@ export class World {
     this.flags = freshFlags;
   }
 
-  private getComponentBit(name: string): bigint {
+  private getComponentBit(name: string): number {
     let bit = this.componentBits.get(name);
     if (bit === undefined) {
-      bit = 1n << this.nextComponentBit;
+      bit = this.nextComponentBit;
       this.nextComponentBit++;
       this.componentBits.set(name, bit);
     }
@@ -337,13 +371,13 @@ export class World {
   }
 
   private addComponentBit(eid: number, name: string): void {
-    const nextMask = this.archetypes.getMask(eid) | this.getComponentBit(name);
+    const nextMask = maskOrBit(this.archetypes.getMask(eid), this.getComponentBit(name), createMask());
     this.archetypes.setMask(eid, nextMask);
     this.flags[eid] |= EntityFlags.ComponentAdded | EntityFlags.ArchetypeChanged;
   }
 
   private removeComponentBit(eid: number, name: string): void {
-    const nextMask = this.archetypes.getMask(eid) & ~this.getComponentBit(name);
+    const nextMask = maskAndNotBit(this.archetypes.getMask(eid), this.getComponentBit(name), createMask());
     this.archetypes.setMask(eid, nextMask);
     this.flags[eid] |= EntityFlags.ComponentRemoved | EntityFlags.ArchetypeChanged;
   }

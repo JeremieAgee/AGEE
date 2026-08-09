@@ -38,8 +38,6 @@ async function main(): Promise<void> {
   engine.physics.addBody(groundEid, "fixed");
   engine.physics.addCollider(groundEid, "box", { halfX: 20, halfY: 0.5, halfZ: 20 });
 
-  const rigidBodyStore = engine.world.getStore(RigidBody);
-
   function createBrick(x: number, y: number, z: number, rotateY: number, hx: number, hy: number, hz: number): number {
     const eid = engine.world.createEntity();
     const color = BRICK_COLORS[Math.floor(Math.random() * BRICK_COLORS.length)];
@@ -52,11 +50,12 @@ async function main(): Promise<void> {
     engine.render.scene.add(mesh);
     engine.world.addComponent(eid, Transform, { x, y, z, rx: 0, ry: rotateY, rz: 0, sx: 1, sy: 1, sz: 1 });
     engine.world.addComponent(eid, MeshRenderer, { meshRef: mesh, visible: 1, castShadow: 1, receiveShadow: 1 });
-    engine.physics.addBody(eid, "dynamic");
+    // RigidBody must exist before addBody() is called — addBody() only updates bodyHandle/
+    // bodyType on an already-registered component, it won't create one for us.
     // High friction / low restitution so the house stands still under gravity and only comes
     // apart when actually struck, instead of jittering itself apart on spawn.
-    rigidBodyStore.set(eid, "friction", 0.9);
-    rigidBodyStore.set(eid, "restitution", 0.05);
+    engine.world.addComponent(eid, RigidBody, { bodyType: 0, mass: 1, restitution: 0.05, friction: 0.9 });
+    engine.physics.addBody(eid, "dynamic");
     engine.physics.addCollider(eid, "box", { halfX: hx, halfY: hy, halfZ: hz });
     return eid;
   }
@@ -118,8 +117,8 @@ async function main(): Promise<void> {
     engine.render.scene.add(mesh);
     engine.world.addComponent(eid, Transform, { x: spawnPos.x, y: spawnPos.y, z: spawnPos.z, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
     engine.world.addComponent(eid, MeshRenderer, { meshRef: mesh, visible: 1, castShadow: 1, receiveShadow: 1 });
+    engine.world.addComponent(eid, RigidBody, { bodyType: 0, mass: 6, restitution: 0.3, friction: 0.5 });
     engine.physics.addBody(eid, "dynamic");
-    rigidBodyStore.set(eid, "mass", 6);
     engine.physics.addCollider(eid, "sphere", { radius: 0.6 });
 
     const body = engine.physics.getBody(eid)!;

@@ -91,7 +91,8 @@ export class LightSync {
           distance[eid], innerCone, outerCone, shadow
         );
       } else if (type === ECS_LIGHT_DIRECTIONAL) {
-        gpu.setDirectionalLight(dx, dy, dz, r, g, b, intensity[eid]);
+        gpu.setDirectionalLight(dx, dy, dz, r, g, b, intensity[eid], shadow);
+        if (shadow) gpu.setDirectionalShadowCaster(dx, dy, dz);
       }
     }
   }

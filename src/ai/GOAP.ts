@@ -1,5 +1,6 @@
 import { MinHeap } from "../core/BinaryHeap";
 import type { Blackboard } from "./BehaviorTree";
+import { syncPerceptionState } from "./PerceptionSync";
 
 export type WorldState = Map<string, number | boolean>;
 export type GOAPActionFn = (eid: number, dt: number, state: WorldState) => "running" | "done" | "failed";
@@ -112,9 +113,31 @@ export class GOAPPlanner {
   // pile of simultaneous replans spreads its cost across several frames instead of spiking one.
   private iterationBudgetPerFrame = 2000;
   private remainingBudget = this.iterationBudgetPerFrame;
+  // Safety net for callers that drive tick() directly instead of through AISystem (which
+  // calls beginFrame() once per real frame): without it, remainingBudget only ever counts
+  // down and a planner used standalone permanently stops producing new plans once the
+  // one-time budget is exhausted, since nothing else would ever replenish it. Refilling on
+  // a real-time window (rather than only via explicit beginFrame() calls) makes the budget
+  // self-sustaining for standalone use while staying a no-op for AISystem-driven use, since
+  // beginFrame() there already resets it well within this window every frame.
+  private static readonly AUTO_REFILL_WINDOW_MS = 1000 / 30;
+  private lastRefillAt = GOAPPlanner.now();
+
+  private static now(): number {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
 
   beginFrame(): void {
     this.remainingBudget = this.iterationBudgetPerFrame;
+    this.lastRefillAt = GOAPPlanner.now();
+  }
+
+  private ensureBudget(): void {
+    const t = GOAPPlanner.now();
+    if (t - this.lastRefillAt >= GOAPPlanner.AUTO_REFILL_WINDOW_MS) {
+      this.remainingBudget = this.iterationBudgetPerFrame;
+      this.lastRefillAt = t;
+    }
   }
 
   createInstance(domain: GOAPDomain, replanInterval = 1.0): GOAPInstance {
@@ -132,14 +155,7 @@ export class GOAPPlanner {
   }
 
   tick(eid: number, instance: GOAPInstance, dt: number, blackboard?: Blackboard | null): string {
-    if (blackboard?.has("hasTarget")) {
-      instance.worldState.set("hasTarget", blackboard.get<boolean>("hasTarget")!);
-      instance.worldState.set("targetEntity", blackboard.get<number>("targetEntity")!);
-      instance.worldState.set("alertLevel", blackboard.get<number>("alertLevel")!);
-      instance.worldState.set("targetLastX", blackboard.get<number>("targetLastX")!);
-      instance.worldState.set("targetLastY", blackboard.get<number>("targetLastY")!);
-      instance.worldState.set("targetLastZ", blackboard.get<number>("targetLastZ")!);
-    }
+    syncPerceptionState(instance.worldState, blackboard);
 
     instance.replanCooldown -= dt;
 
@@ -180,6 +196,7 @@ export class GOAPPlanner {
   }
 
   private selectGoalAndPlan(eid: number, instance: GOAPInstance): void {
+    this.ensureBudget();
     if (!instance.pendingSearch) {
       // Budget already spent by other agents this frame -- leave the trigger conditions in
       // tick() unsatisfied-and-retried (plan stays empty / actionStatus stays "failed") so

@@ -54,7 +54,7 @@ export class ArchetypeIndex {
     this.bumpIfRelevant(oldMask, createMask());
   }
 
-  private matchCache = new Map<string, { version: number; result: Archetype[] }>();
+  private matchCache = new Map<string, { version: number; result: Archetype[]; mask: Mask }>();
 
   // Only bump the shared version counter when the archetype transition (oldMask -> newMask)
   // could actually change the result of a query whose mask has been looked up before (i.e. is
@@ -64,16 +64,13 @@ export class ArchetypeIndex {
   // affected by this transition iff the entity was (or now is) part of an archetype that
   // satisfies `m` — i.e. (oldMask & m) === m or (newMask & m) === m.
   private bumpIfRelevant(oldMask: Mask, newMask: Mask): void {
-    for (const key of this.matchCache.keys()) {
-      const queryMask = this.matchCacheMasks.get(key)!;
-      if (maskContainsAll(oldMask, queryMask) || maskContainsAll(newMask, queryMask)) {
+    for (const entry of this.matchCache.values()) {
+      if (maskContainsAll(oldMask, entry.mask) || maskContainsAll(newMask, entry.mask)) {
         this._version++;
         return;
       }
     }
   }
-
-  private matchCacheMasks = new Map<string, Mask>();
 
   matching(queryMask: Mask): Archetype[] {
     const key = maskKey(queryMask);
@@ -93,8 +90,7 @@ export class ArchetypeIndex {
       cached.version = this._version;
       cached.result = result;
     } else {
-      this.matchCache.set(key, { version: this._version, result });
-      this.matchCacheMasks.set(key, maskClone(queryMask));
+      this.matchCache.set(key, { version: this._version, result, mask: maskClone(queryMask) });
     }
     return result;
   }
@@ -105,7 +101,6 @@ export class ArchetypeIndex {
     this.entityMasks.length = 0;
     this.entityPositions.length = 0;
     this.matchCache.clear();
-    this.matchCacheMasks.clear();
     this._version++;
   }
 

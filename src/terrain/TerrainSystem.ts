@@ -2,7 +2,7 @@ import * as THREE from "three";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { System } from "../ecs";
 import { NoiseGenerator, NoiseConfig } from "./NoiseGenerator";
-import { ChunkBuildRequest, ChunkBuildResult } from "./TerrainChunkBuilder";
+import { ChunkBuildRequest, ChunkBuildResult, buildChunkDataSteps } from "./TerrainChunkBuilder";
 import { TerrainWorkerClient } from "./TerrainWorkerClient";
 
 export interface TerrainConfig {
@@ -284,9 +284,10 @@ export class TerrainSystem extends System {
     return Math.max(2, Math.round((base - 1) / 4) + 1);
   }
 
-  // Dispatches the actual chunk generation (see sliceChunkBuild — noise sampling +
-  // vertex/UV/index/normal computation, the real CPU cost) either to the terrain worker when
-  // one is active, or inline on the main thread as a fallback. Either way, the slot isn't
+  // Dispatches the actual chunk generation (see TerrainChunkBuilder.buildChunkDataSteps —
+  // noise sampling + vertex/UV/index/normal computation, the real CPU cost) either to the
+  // terrain worker when one is active, or inline on the main thread as a fallback. Either
+  // way, the slot isn't
   // allocated and nothing is added to the scene/physics world until finalizeChunk() runs —
   // with the worker path that happens later, asynchronously, once the response arrives; with
   // the inline path it happens as soon as the build completes, which is immediately (within
@@ -320,11 +321,11 @@ export class TerrainSystem extends System {
           console.error(`[AGEE] Terrain worker failed to build chunk (${cx},${cz}):`, err);
         });
     } else {
-      this.runSlicedBuild({ key, cx, cz, res, gen: this.sliceChunkBuild(request) }, deadline);
+      this.runSlicedBuild({ key, cx, cz, res, gen: buildChunkDataSteps(request) }, deadline);
     }
   }
 
-  // Advances a fallback chunk build one row-batch at a time (see sliceChunkBuild) until either
+  // Advances a fallback chunk build one row-batch at a time (see buildChunkDataSteps) until either
   // the build finishes (result handed to onChunkBuilt, same as the worker path's .then()) or
   // `deadline` (a performance.now() timestamp) passes, in which case the job is parked on
   // slicedBuildQueue to be resumed from exactly where it left off by the next update() call.
@@ -342,99 +343,6 @@ export class TerrainSystem extends System {
         return;
       }
     }
-  }
-
-  // Reimplements TerrainChunkBuilder.buildChunkData's math (heightmap -> positions/uvs ->
-  // indices -> normals -> optional collider vertices) as a generator that yields after each
-  // row instead of returning the finished result in one uninterruptible call, so runSlicedBuild
-  // can bound how much of it happens within a single update()'s time budget. Must stay
-  // numerically identical to buildChunkData — the worker path still calls that function
-  // directly, and the two are expected to produce the same terrain for the same request.
-  private *sliceChunkBuild(request: ChunkBuildRequest): Generator<void, ChunkBuildResult, void> {
-    const { cx, cz, chunkSize, resolution: res, noise: noiseConfig, buildCollider } = request;
-    const noise = new NoiseGenerator(noiseConfig);
-    const worldX = cx * chunkSize;
-    const worldZ = cz * chunkSize;
-    const step = chunkSize / (res - 1);
-
-    const heightmap = new Float32Array(res * res);
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        heightmap[z * res + x] = noise.sample(worldX + x * step, worldZ + z * step);
-      }
-      yield;
-    }
-
-    const positions = new Float32Array(res * res * 3);
-    const uvs = new Float32Array(res * res * 2);
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const i = z * res + x;
-        positions[i * 3] = x * step;
-        positions[i * 3 + 1] = heightmap[i];
-        positions[i * 3 + 2] = z * step;
-        uvs[i * 2] = x / (res - 1);
-        uvs[i * 2 + 1] = z / (res - 1);
-      }
-      yield;
-    }
-
-    const indices = new Uint32Array((res - 1) * (res - 1) * 6);
-    let idx = 0;
-    for (let z = 0; z < res - 1; z++) {
-      for (let x = 0; x < res - 1; x++) {
-        const tl = z * res + x;
-        indices[idx++] = tl;
-        indices[idx++] = (z + 1) * res + x;
-        indices[idx++] = tl + 1;
-        indices[idx++] = tl + 1;
-        indices[idx++] = (z + 1) * res + x;
-        indices[idx++] = (z + 1) * res + x + 1;
-      }
-      yield;
-    }
-
-    const normals = new Float32Array(res * res * 3);
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const hL = x > 0 ? heightmap[z * res + (x - 1)] : noise.sample(worldX + (x - 1) * step, worldZ + z * step);
-        const hR = x < res - 1 ? heightmap[z * res + (x + 1)] : noise.sample(worldX + (x + 1) * step, worldZ + z * step);
-        const hD = z > 0 ? heightmap[(z - 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z - 1) * step);
-        const hU = z < res - 1 ? heightmap[(z + 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z + 1) * step);
-
-        const dhdx = (hR - hL) / (2 * step);
-        const dhdz = (hU - hD) / (2 * step);
-
-        const nx = -dhdx;
-        const ny = 1;
-        const nz = -dhdz;
-        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-
-        const i = (z * res + x) * 3;
-        normals[i] = nx / len;
-        normals[i + 1] = ny / len;
-        normals[i + 2] = nz / len;
-      }
-      yield;
-    }
-
-    let colliderVertices: Float32Array | null = null;
-    let colliderIndices: Uint32Array | null = null;
-    if (buildCollider) {
-      colliderVertices = new Float32Array(res * res * 3);
-      for (let z = 0; z < res; z++) {
-        for (let x = 0; x < res; x++) {
-          const i = z * res + x;
-          colliderVertices[i * 3] = worldX + x * step;
-          colliderVertices[i * 3 + 1] = heightmap[i];
-          colliderVertices[i * 3 + 2] = worldZ + z * step;
-        }
-        yield;
-      }
-      colliderIndices = indices;
-    }
-
-    return { heightmap, positions, uvs, normals, indices, colliderVertices, colliderIndices };
   }
 
   private onChunkBuilt(key: string, cx: number, cz: number, res: number, result: ChunkBuildResult): void {

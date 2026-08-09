@@ -25,16 +25,27 @@ export interface ChunkBuildResult {
 // one up) and terrain.worker.ts's off-main-thread path. THREE.Mesh/Rapier bodies can't be
 // created off the main thread, so this only produces the plain typed arrays TerrainSystem later
 // turns into those — that main-thread-only assembly step is deliberately NOT here.
-export function buildChunkData(req: ChunkBuildRequest): ChunkBuildResult {
+//
+// Written as a generator, yielding after each row, so TerrainSystem's time-sliced fallback
+// (which can't afford to block the main thread for a whole large chunk in one call) can pause
+// and resume it across several update() calls without a second, hand-copied implementation of
+// this math to keep in sync — buildChunkData() below just drains it to completion in one go for
+// callers (the worker, tests) that don't need slicing.
+export function* buildChunkDataSteps(req: ChunkBuildRequest): Generator<void, ChunkBuildResult, void> {
   const { cx, cz, chunkSize, resolution: res, noise: noiseConfig, buildCollider } = req;
   const noise = new NoiseGenerator(noiseConfig);
   const worldX = cx * chunkSize;
   const worldZ = cz * chunkSize;
+  const step = chunkSize / (res - 1);
 
   const heightmap = new Float32Array(res * res);
-  noise.fillHeightmap(heightmap, res, worldX, worldZ, chunkSize);
+  for (let z = 0; z < res; z++) {
+    for (let x = 0; x < res; x++) {
+      heightmap[z * res + x] = noise.sample(worldX + x * step, worldZ + z * step);
+    }
+    yield;
+  }
 
-  const step = chunkSize / (res - 1);
   const positions = new Float32Array(res * res * 3);
   const uvs = new Float32Array(res * res * 2);
   for (let z = 0; z < res; z++) {
@@ -46,6 +57,7 @@ export function buildChunkData(req: ChunkBuildRequest): ChunkBuildResult {
       uvs[i * 2] = x / (res - 1);
       uvs[i * 2 + 1] = z / (res - 1);
     }
+    yield;
   }
 
   // Shared by both the visual mesh and the physics trimesh (when requested) — the collider is
@@ -63,53 +75,23 @@ export function buildChunkData(req: ChunkBuildRequest): ChunkBuildResult {
       indices[idx++] = (z + 1) * res + x;
       indices[idx++] = (z + 1) * res + x + 1;
     }
+    yield;
   }
 
-  const normals = computeHeightFieldNormals(noise, heightmap, res, worldX, worldZ, step);
-
-  let colliderVertices: Float32Array | null = null;
-  let colliderIndices: Uint32Array | null = null;
-  if (buildCollider) {
-    // Collider vertices are in world space (the visual mesh's positions are chunk-local and
-    // get placed via mesh.position.set(worldX, 0, worldZ) on the main thread instead).
-    colliderVertices = new Float32Array(res * res * 3);
-    for (let z = 0; z < res; z++) {
-      for (let x = 0; x < res; x++) {
-        const i = z * res + x;
-        colliderVertices[i * 3] = worldX + x * step;
-        colliderVertices[i * 3 + 1] = heightmap[i];
-        colliderVertices[i * 3 + 2] = worldZ + z * step;
-      }
-    }
-    colliderIndices = indices;
-  }
-
-  return { heightmap, positions, uvs, normals, indices, colliderVertices, colliderIndices };
-}
-
-// Computes per-vertex normals from the height field analytically (central differences of
-// world-space height samples) instead of averaging face normals of the local mesh only. Any
-// sample that falls outside this chunk's own heightmap is pulled from the shared noise function
-// at that exact world position rather than from the neighboring chunk's heightmap array, so two
-// adjacent chunks evaluate identical world-space height samples on either side of their shared
-// edge and therefore produce matching (seamless) normals at the boundary, even though each
-// chunk builds its geometry independently.
-function computeHeightFieldNormals(
-  noise: NoiseGenerator,
-  hm: Float32Array,
-  res: number,
-  worldX: number,
-  worldZ: number,
-  step: number
-): Float32Array {
+  // Computes per-vertex normals from the height field analytically (central differences of
+  // world-space height samples) instead of averaging face normals of the local mesh only. Any
+  // sample that falls outside this chunk's own heightmap is pulled from the shared noise
+  // function at that exact world position rather than from the neighboring chunk's heightmap
+  // array, so two adjacent chunks evaluate identical world-space height samples on either side
+  // of their shared edge and therefore produce matching (seamless) normals at the boundary,
+  // even though each chunk builds its geometry independently.
   const normals = new Float32Array(res * res * 3);
-
   for (let z = 0; z < res; z++) {
     for (let x = 0; x < res; x++) {
-      const hL = x > 0 ? hm[z * res + (x - 1)] : noise.sample(worldX + (x - 1) * step, worldZ + z * step);
-      const hR = x < res - 1 ? hm[z * res + (x + 1)] : noise.sample(worldX + (x + 1) * step, worldZ + z * step);
-      const hD = z > 0 ? hm[(z - 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z - 1) * step);
-      const hU = z < res - 1 ? hm[(z + 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z + 1) * step);
+      const hL = x > 0 ? heightmap[z * res + (x - 1)] : noise.sample(worldX + (x - 1) * step, worldZ + z * step);
+      const hR = x < res - 1 ? heightmap[z * res + (x + 1)] : noise.sample(worldX + (x + 1) * step, worldZ + z * step);
+      const hD = z > 0 ? heightmap[(z - 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z - 1) * step);
+      const hU = z < res - 1 ? heightmap[(z + 1) * res + x] : noise.sample(worldX + x * step, worldZ + (z + 1) * step);
 
       const dhdx = (hR - hL) / (2 * step);
       const dhdz = (hU - hD) / (2 * step);
@@ -124,7 +106,36 @@ function computeHeightFieldNormals(
       normals[i + 1] = ny / len;
       normals[i + 2] = nz / len;
     }
+    yield;
   }
 
-  return normals;
+  let colliderVertices: Float32Array | null = null;
+  let colliderIndices: Uint32Array | null = null;
+  if (buildCollider) {
+    // Collider vertices are in world space (the visual mesh's positions are chunk-local and
+    // get placed via mesh.position.set(worldX, 0, worldZ) on the main thread instead).
+    colliderVertices = new Float32Array(res * res * 3);
+    for (let z = 0; z < res; z++) {
+      for (let x = 0; x < res; x++) {
+        const i = z * res + x;
+        colliderVertices[i * 3] = worldX + x * step;
+        colliderVertices[i * 3 + 1] = heightmap[i];
+        colliderVertices[i * 3 + 2] = worldZ + z * step;
+      }
+      yield;
+    }
+    colliderIndices = indices;
+  }
+
+  return { heightmap, positions, uvs, normals, indices, colliderVertices, colliderIndices };
+}
+
+// Runs buildChunkDataSteps() to completion in one synchronous call — for callers (the worker,
+// tests, any direct/non-time-sliced use) that want the whole result at once instead of pausing
+// across multiple calls.
+export function buildChunkData(req: ChunkBuildRequest): ChunkBuildResult {
+  const gen = buildChunkDataSteps(req);
+  let step = gen.next();
+  while (!step.done) step = gen.next();
+  return step.value;
 }

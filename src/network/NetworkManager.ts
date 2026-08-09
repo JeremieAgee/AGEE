@@ -47,6 +47,13 @@ export class NetworkManager {
   // expected to read it off the first message on a new transport and pass it into addClient().
   private authValidator: ((clientId: number, token: string) => boolean) | null = null;
   private connectAckWriter = new BinaryWriter(16);
+  // Clients already validated + ACKed, either synchronously by addClient() or by the
+  // deferred wire-level Connect handshake below. Prevents onConnectRequest from re-running
+  // authValidator against a client that was already accepted — that second check runs
+  // against whatever token the client's own NetworkManager.connect(url, token) call used
+  // (default ""), which can differ from an out-of-band token addClient() already validated,
+  // and would otherwise kick an already-accepted client.
+  private acceptedClients = new Set<number>();
 
   constructor(world: World, config: NetworkConfig) {
     this.world = world;
@@ -119,12 +126,14 @@ export class NetworkManager {
     // the same authValidator addClient() uses, but against the token the client actually sent
     // over the wire rather than one host code had to intercept and pass into addClient() itself.
     this.receiveSystem.onConnectRequest = (token, transport, clientId) => {
+      if (this.acceptedClients.has(clientId)) return;
       if (this.authValidator && !this.authValidator(clientId, token)) {
         console.warn(`[Network] Rejecting client ${clientId}: auth validator declined the connection`);
         transport.disconnect();
         this.removeClient(clientId);
         return;
       }
+      this.acceptedClients.add(clientId);
       this.sendConnectAck(clientId, transport);
     };
   }
@@ -195,11 +204,15 @@ export class NetworkManager {
 
   /** Registers a server-side client connection. Returns false (and disconnects the
    *  transport without registering it anywhere) if an auth validator is configured and
-   *  rejects `token` — otherwise the client is accepted exactly as before. `token` defaults
-   *  to "" for callers that don't do wire-level auth (matches pre-existing behavior when no
-   *  validator is set). */
-  addClient(clientId: number, clientTransport: Transport, token: string = ""): boolean {
-    if (this.authValidator && !this.authValidator(clientId, token)) {
+   *  rejects an explicitly-passed `token` — otherwise the client is accepted exactly as
+   *  before. `token` is omitted (rather than defaulting to "") for callers that don't do
+   *  out-of-band auth: with a validator configured, that defers acceptance to the client's
+   *  own wire-level Connect handshake (see onConnectRequest above) instead of validating a
+   *  placeholder empty token immediately and rejecting the client before that handshake
+   *  ever arrives. With no validator configured, an omitted token still accepts immediately
+   *  (matches pre-existing behavior). */
+  addClient(clientId: number, clientTransport: Transport, token?: string): boolean {
+    if (this.authValidator && token !== undefined && !this.authValidator(clientId, token)) {
       console.warn(`[Network] Rejecting client ${clientId}: auth validator declined the connection`);
       clientTransport.disconnect();
       return false;
@@ -211,11 +224,17 @@ export class NetworkManager {
     // this layer entirely to send its own. Sending it here means host code accepting a connection
     // and calling addClient() with a token it already validated out-of-band doesn't also have to
     // wait for the wire-level Connect message (see onConnectRequest above) to get acknowledged.
-    this.sendConnectAck(clientId, clientTransport);
+    if (!this.authValidator || token !== undefined) {
+      this.acceptedClients.add(clientId);
+      this.sendConnectAck(clientId, clientTransport);
+    }
+    // else: a validator is configured but no token was supplied here — wait for
+    // onConnectRequest to validate the client's self-reported wire-level token instead.
     return true;
   }
 
   removeClient(clientId: number): void {
+    this.acceptedClients.delete(clientId);
     this.sendSystem.removeClient(clientId);
     this.receiveSystem.removeClientTransport(clientId);
   }

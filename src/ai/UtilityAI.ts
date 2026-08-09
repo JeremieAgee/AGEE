@@ -1,4 +1,5 @@
 import type { Blackboard } from "./BehaviorTree";
+import { syncPerceptionState } from "./PerceptionSync";
 
 export type ScoreFunction = (eid: number, context: UtilityContext) => number;
 export type UtilityActionFn = (eid: number, dt: number, context: UtilityContext) => void;
@@ -103,14 +104,7 @@ export class UtilityRunner {
   }
 
   tick(eid: number, instance: UtilityInstance, dt: number, blackboard?: Blackboard | null): string {
-    if (blackboard?.has("hasTarget")) {
-      instance.blackboard.set("hasTarget", blackboard.get("hasTarget"));
-      instance.blackboard.set("targetEntity", blackboard.get("targetEntity"));
-      instance.blackboard.set("alertLevel", blackboard.get("alertLevel"));
-      instance.blackboard.set("targetLastX", blackboard.get("targetLastX"));
-      instance.blackboard.set("targetLastY", blackboard.get("targetLastY"));
-      instance.blackboard.set("targetLastZ", blackboard.get("targetLastZ"));
-    }
+    syncPerceptionState(instance.blackboard, blackboard);
 
     const ctx: UtilityContext = {
       dt,

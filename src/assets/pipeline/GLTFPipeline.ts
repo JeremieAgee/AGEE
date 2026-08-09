@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader, GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { World } from "../../ecs";
 import { Transform, MeshRenderer, GPUMeshRenderer } from "../../core/Components";
 import { LocalTransform, WorldTransform, Parent, Children } from "../../core/HierarchyComponents";
@@ -10,6 +11,7 @@ import type { GPUMaterialPool } from "../../gpu/GPUMaterialPool";
 import { extractGeometry } from "../../gpu/ThreeGeometryAdapter";
 import { AssetSystem } from "../AssetSystem";
 import { AssetType, AssetHandle, AssetId, INVALID_ASSET } from "../AssetTypes";
+import { estimateTextureBytes } from "../MemoryEstimates";
 import { ResourceType } from "../../core/handles/Handle";
 
 // THREE.Material property names that may hold a texture map, checked when registering a
@@ -28,12 +30,6 @@ function estimateGeometryBytes(geo: THREE.BufferGeometry): number {
   }
   if (geo.index) bytes += geo.index.array.byteLength;
   return bytes;
-}
-
-function estimateTextureBytes(tex: THREE.Texture): number {
-  const img = tex.image as { width?: number; height?: number } | undefined;
-  const w = img?.width ?? 0, h = img?.height ?? 0;
-  return Math.round(w * h * 4 * 1.33); // RGBA8 + ~mip overhead
 }
 
 export interface GLTFAsset {
@@ -230,10 +226,12 @@ export class GLTFPipeline {
     // createEntityFromObject reparents whatever Object3D it's handed (parentScene.add(obj) —
     // THREE.Object3D.add() removes the child from its previous parent first). Without cloning,
     // a second instantiate() of the same cached asset.sceneRoot rips its meshes out of the
-    // first instance's scene instead of creating an independent instance. clone(true) shares
-    // geometry/material by reference (the expensive GPU-side data) and only deep-copies the
-    // lightweight Object3D transform hierarchy, so this doesn't duplicate any asset memory.
-    const instanceRoot = asset.sceneRoot.clone(true);
+    // first instance's scene instead of creating an independent instance. SkeletonUtils.clone()
+    // shares geometry/material by reference (the expensive GPU-side data) and only deep-copies
+    // the lightweight Object3D transform hierarchy, so this doesn't duplicate any asset memory —
+    // unlike plain Object3D.clone(true), it also rebinds any SkinnedMesh's skeleton to the
+    // cloned Bone hierarchy instead of leaving it pointed at the original instance's bones.
+    const instanceRoot = cloneSkeleton(asset.sceneRoot) as THREE.Object3D;
     const rootEid = this.createEntityFromObject(instanceRoot, world, parentScene, result, null);
     result.rootEntity = rootEid;
 

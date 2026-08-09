@@ -57,6 +57,10 @@ export class CullingSystem extends System {
   private fMinZ = 0;
   private fMaxZ = 0;
 
+  // Radius assumed for renderables with no geometry bounding sphere to measure (container/
+  // group meshes handled by getSubtreeWorldBox) when padding the broad-phase query below.
+  private static readonly CONTAINER_FALLBACK_RADIUS = 32;
+
   setCamera(camera: THREE.Camera): void {
     this.camera = camera;
   }
@@ -92,13 +96,36 @@ export class CullingSystem extends System {
     const aabb = this.aabb;
 
     this.spatialHash.clear();
+    // The hash only indexes each entity by its Transform origin point, not its extent, so the
+    // broad-phase query below is padded by the largest renderable radius seen this frame —
+    // otherwise a large mesh (a building, terrain slab, long wall) whose origin sits just
+    // outside the frustum's XZ footprint but whose geometry still extends into view would be
+    // excluded as a candidate and forced invisible before the precise per-mesh test ever runs.
+    let maxRadius = 0;
     for (let i = 0; i < entities.length; i++) {
       const eid = entities[i];
-      if (!meshRefs[eid]) continue;
+      const mesh = meshRefs[eid] as THREE.Object3D | null;
+      if (!mesh) continue;
       this.spatialHash.insert(eid, tx[eid], tz[eid]);
+
+      const meshObj = mesh as THREE.Mesh;
+      let radius: number;
+      if (meshObj.geometry) {
+        if (!meshObj.geometry.boundingSphere) meshObj.geometry.computeBoundingSphere();
+        radius = meshObj.geometry.boundingSphere?.radius ?? 0;
+      } else if (mesh.children.length > 0) {
+        radius = CullingSystem.CONTAINER_FALLBACK_RADIUS;
+      } else {
+        radius = 0;
+      }
+      if (radius > maxRadius) maxRadius = radius;
     }
     this.updateFrustumXZBounds();
-    this.spatialHash.queryAABB(this.fMinX, this.fMinZ, this.fMaxX, this.fMaxZ, this.candidateIds);
+    this.spatialHash.queryAABB(
+      this.fMinX - maxRadius, this.fMinZ - maxRadius,
+      this.fMaxX + maxRadius, this.fMaxZ + maxRadius,
+      this.candidateIds
+    );
     this.candidateSet.clear();
     for (let i = 0; i < this.candidateIds.length; i++) this.candidateSet.add(this.candidateIds[i]);
 

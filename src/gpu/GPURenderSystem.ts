@@ -78,6 +78,12 @@ export class GPURenderSystem extends System {
   private gpuCtx!: GPUContext;
   private layouts!: FrameLayouts;
   private pipelines = new Map<PipelineKey, GPURenderPipeline>();
+  // Same 6 pipelines as `pipelines`, indexed without building a template-string key — the draw
+  // loop below resolves one of these per visible entity every frame, so avoiding a string
+  // allocation there (in addition to the material-info allocation fixed alongside it) matters
+  // at scale. [blend][cullIndex], cullIndex 0 = "back", 1 = "none".
+  private pipelinesByBlendCull!: Record<GPUBlendMode, [GPURenderPipeline, GPURenderPipeline]>;
+  private pipelinesReady = false;
 
   private transformStore!: ComponentStore;
   private meshRendererStore!: ComponentStore;
@@ -197,37 +203,54 @@ export class GPURenderSystem extends System {
       },
     };
 
+    // createRenderPipelineAsync lets the driver compile all 6 pipelines concurrently instead
+    // of blocking the main thread on 6 back-to-back synchronous shader-compiles at startup --
+    // update() checks pipelinesReady and simply skips drawing (still presenting/clearing the
+    // frame) until they land, which is at most a handful of frames during initial load.
+    const pipelinePromises: Promise<void>[] = [];
     for (const blend of ["opaque", "alpha", "additive"] as const) {
       for (const cullMode of ["back", "none"] as const) {
         const key: PipelineKey = `${blend}:${cullMode}`;
-        this.pipelines.set(key, device.createRenderPipeline({
-          label: `AGEE forward ${key}`,
-          layout: this.layouts.pipelineLayout,
-          vertex: {
-            module: shaderModule,
-            entryPoint: "vs",
-            buffers: [VERTEX_BUFFER_LAYOUT],
-          },
-          fragment: {
-            module: shaderModule,
-            entryPoint: "fs",
-            targets: [{ format: this.gpuCtx.format, blend: blendStates[blend] }],
-          },
-          primitive: {
-            topology: "triangle-list",
-            cullMode,
-            frontFace: "ccw",
-          },
-          depthStencil: {
-            format: "depth24plus",
-            // Blended surfaces don't write depth -- writing depth for a translucent
-            // fragment would let it occlude whatever should still be visible behind it.
-            depthWriteEnabled: blend === "opaque",
-            depthCompare: "less",
-          },
-        }));
+        pipelinePromises.push(
+          device.createRenderPipelineAsync({
+            label: `AGEE forward ${key}`,
+            layout: this.layouts.pipelineLayout,
+            vertex: {
+              module: shaderModule,
+              entryPoint: "vs",
+              buffers: [VERTEX_BUFFER_LAYOUT],
+            },
+            fragment: {
+              module: shaderModule,
+              entryPoint: "fs",
+              targets: [{ format: this.gpuCtx.format, blend: blendStates[blend] }],
+            },
+            primitive: {
+              topology: "triangle-list",
+              cullMode,
+              frontFace: "ccw",
+            },
+            depthStencil: {
+              format: "depth24plus",
+              // Blended surfaces don't write depth -- writing depth for a translucent
+              // fragment would let it occlude whatever should still be visible behind it.
+              depthWriteEnabled: blend === "opaque",
+              depthCompare: "less",
+            },
+          }).then((pipeline) => {
+            this.pipelines.set(key, pipeline);
+          })
+        );
       }
     }
+    Promise.all(pipelinePromises).then(() => {
+      this.pipelinesByBlendCull = {
+        opaque: [this.pipelines.get("opaque:back")!, this.pipelines.get("opaque:none")!],
+        alpha: [this.pipelines.get("alpha:back")!, this.pipelines.get("alpha:none")!],
+        additive: [this.pipelines.get("additive:back")!, this.pipelines.get("additive:none")!],
+      };
+      this.pipelinesReady = true;
+    });
 
     this.cameraBuffer = device.createBuffer({
       label: "AGEE camera",
@@ -519,7 +542,10 @@ export class GPURenderSystem extends System {
     this.drawList.length = 0;
     this.transparentList.length = 0;
 
-    for (let i = 0; i < entities.length; i++) {
+    // Pipelines are created via createRenderPipelineAsync (see init()) so a handful of startup
+    // frames can land before they're ready — skip building draw calls for those (the frame is
+    // still presented/cleared below) rather than dereferencing pipelines that don't exist yet.
+    for (let i = 0; this.pipelinesReady && i < entities.length; i++) {
       const eid = entities[i];
       if (visibleCol[eid] === 0) continue;
 
@@ -539,7 +565,7 @@ export class GPURenderSystem extends System {
 
       const px = tx[eid], py = ty[eid], pz = tz[eid];
       const prx = trx[eid], pry = trY[eid], prz = trz[eid];
-      const psx = tsx[eid] || 1, psy = tsy[eid] || 1, psz = tsz[eid] || 1;
+      const psx = tsx[eid], psy = tsy[eid], psz = tsz[eid];
 
       const cacheBase = eid * 32;
       const dirty = this.cachedValid[eid] === 0
@@ -579,10 +605,9 @@ export class GPURenderSystem extends System {
 
       const matHandle = matHandles[eid] as number as Handle;
       const materialBG = this._materialPool.getBindGroup(matHandle) ?? this._materialPool.defaultBindGroup;
-      const matInfo = this._materialPool.getMaterialInfo(matHandle);
-      const blend: GPUBlendMode = matInfo?.blend ?? "opaque";
-      const cullMode: "back" | "none" = matInfo?.doubleSided ? "none" : "back";
-      const pipeline = this.pipelines.get(`${blend}:${cullMode}`)!;
+      const blend = this._materialPool.getBlend(matHandle);
+      const doubleSided = this._materialPool.getDoubleSided(matHandle);
+      const pipeline = this.pipelinesByBlendCull[blend][doubleSided ? 1 : 0];
 
       const call: DrawCall = {
         mesh,

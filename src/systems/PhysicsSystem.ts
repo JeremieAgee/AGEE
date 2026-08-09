@@ -236,20 +236,24 @@ export class PhysicsSystem extends System {
     const tx = this.transformStore.get(eid, "x");
     const ty = this.transformStore.get(eid, "y");
     const tz = this.transformStore.get(eid, "z");
+    const trx = this.transformStore.get(eid, "rx");
+    const trY = this.transformStore.get(eid, "ry");
+    const trz = this.transformStore.get(eid, "rz");
+    const initialQuat = deulerToQuaternion(trx as number, trY as number, trz as number);
 
     let desc: RAPIER.RigidBodyDesc;
     let bodyType: number;
     switch (type) {
       case "fixed":
-        desc = RAPIER.RigidBodyDesc.fixed().setTranslation(tx, ty, tz);
+        desc = RAPIER.RigidBodyDesc.fixed().setTranslation(tx, ty, tz).setRotation(initialQuat);
         bodyType = 1;
         break;
       case "kinematic":
-        desc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(tx, ty, tz);
+        desc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(tx, ty, tz).setRotation(initialQuat);
         bodyType = 2;
         break;
       default:
-        desc = RAPIER.RigidBodyDesc.dynamic().setTranslation(tx, ty, tz);
+        desc = RAPIER.RigidBodyDesc.dynamic().setTranslation(tx, ty, tz).setRotation(initialQuat);
         bodyType = 0;
     }
 
@@ -428,6 +432,35 @@ export class PhysicsSystem extends System {
 
   getBody(eid: number): RAPIER.RigidBody | undefined {
     return this.bodies[eid] ?? undefined;
+  }
+
+  // Switches an existing body's type in place (e.g. "static until struck" — spawn bricks fixed
+  // for cheap idle simulation, then flip the ones actually hit to dynamic). Rapier requires the
+  // body to be woken explicitly since a just-unfrozen fixed body has no velocity to wake itself.
+  setBodyType(eid: number, type: "dynamic" | "fixed" | "kinematic"): void {
+    const body = this.bodies[eid];
+    if (!body) throw new Error(`No rigid body on entity ${eid}`);
+
+    let rapierType: RAPIER.RigidBodyType;
+    let bodyType: number;
+    switch (type) {
+      case "fixed":
+        rapierType = RAPIER.RigidBodyType.Fixed;
+        bodyType = 1;
+        break;
+      case "kinematic":
+        rapierType = RAPIER.RigidBodyType.KinematicPositionBased;
+        bodyType = 2;
+        break;
+      default:
+        rapierType = RAPIER.RigidBodyType.Dynamic;
+        bodyType = 0;
+    }
+
+    body.setBodyType(rapierType, true);
+    if (this.rigidBodyStore.has(eid)) {
+      this.rigidBodyStore.set(eid, "bodyType", bodyType);
+    }
   }
 
   getCollider(eid: number): RAPIER.Collider | undefined {

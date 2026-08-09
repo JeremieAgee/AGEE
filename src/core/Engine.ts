@@ -348,8 +348,13 @@ export class AGEE {
       if (gpuMeshStore.has(eid)) {
         const meshHandle = gpuMeshStore.get(eid, "meshHandle") as number as Handle;
         const materialHandle = gpuMeshStore.get(eid, "materialHandle") as number as Handle;
+        // free() returns entry.data both when this call fully frees the slot AND when another
+        // retain() still holds a reference (it just decrements and returns the same data) —
+        // the two cases are indistinguishable from the return value alone. Check the refcount
+        // first so destroy() only runs once nothing else is still holding this mesh.
+        const wasLastMeshRef = this.gpuMeshPool.getRefCount(meshHandle) <= 1;
         const mesh = this.gpuMeshPool.free(meshHandle);
-        mesh?.destroy();
+        if (wasLastMeshRef) mesh?.destroy();
         this.gpuRender?.materialPool?.free(materialHandle);
       }
     });

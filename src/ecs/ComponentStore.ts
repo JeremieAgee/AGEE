@@ -45,6 +45,7 @@ export class ComponentStore<S extends ComponentSchema = ComponentSchema> {
   private capacity = INITIAL_CAPACITY;
   private addCallbacks: ComponentCallback[] = [];
   private removeCallbacks: ComponentCallback[] = [];
+  private setCallbacks: ComponentCallback[] = [];
 
   constructor(def: ComponentDef<S>) {
     this.def = def;
@@ -66,6 +67,18 @@ export class ComponentStore<S extends ComponentSchema = ComponentSchema> {
     return () => {
       const idx = this.removeCallbacks.indexOf(callback);
       if (idx !== -1) this.removeCallbacks.splice(idx, 1);
+    };
+  }
+
+  // Fires on every set() call (not add()/bulk-create) -- lets a dependent system (e.g.
+  // TransformHierarchySystem marking WorldTransform dirty on a LocalTransform edit) react to
+  // a field write without every caller needing to remember an explicit "mark dirty" step. Costs
+  // one length check per set() call for stores with no listeners.
+  onSet(callback: ComponentCallback): () => void {
+    this.setCallbacks.push(callback);
+    return () => {
+      const idx = this.setCallbacks.indexOf(callback);
+      if (idx !== -1) this.setCallbacks.splice(idx, 1);
     };
   }
 
@@ -140,5 +153,8 @@ export class ComponentStore<S extends ComponentSchema = ComponentSchema> {
       this.grow();
     }
     this.columns[field as string][entityId] = this.def.schema[field as string] === "bool" ? (value ? 1 : 0) : value;
+    if (this.setCallbacks.length !== 0) {
+      for (let i = 0; i < this.setCallbacks.length; i++) this.setCallbacks[i](entityId);
+    }
   }
 }

@@ -12,8 +12,6 @@ const tmpMat = new Mat4();
 const MAX_HIERARCHY_DEPTH = 64;
 const matStack: Mat4[] = Array.from({ length: MAX_HIERARCHY_DEPTH }, () => new Mat4());
 
-const INITIAL_LOCAL_CACHE_CAPACITY = 256;
-
 export class TransformHierarchySystem extends System {
   priority = 200;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "postPhysics";
@@ -31,32 +29,28 @@ export class TransformHierarchySystem extends System {
   // Cycle detection: track entities being visited in current traversal
   private visiting = new Set<number>();
 
-  // Per-entity cache of the last-seen LocalTransform values, so a direct write to
-  // LocalTransform (moving a turret head, a weapon socket, an attached prop) is detected here
-  // every frame by comparison instead of depending on the caller remembering to call
-  // markDirty() — markDirty() existed as a public API but nothing in the engine ever called
-  // it, so any LocalTransform edit after an entity's first frame silently stopped propagating
-  // to WorldTransform. This mirrors the same cached-compare pattern GPURenderSystem already
-  // uses for its own per-entity model-matrix cache.
-  private localCacheCapacity = 0;
-  private cachedLx: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLy: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLz: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLrx: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLry: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLrz: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLrw: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLsx: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLsy: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLsz: Float32Array<ArrayBuffer> = new Float32Array(0);
-  private cachedLocalValid: Uint8Array<ArrayBuffer> = new Uint8Array(0);
-
   init(): void {
     this.localStore = this.world.getStore(LocalTransform);
     this.worldStore = this.world.getStore(WorldTransform);
     this.parentStore = this.world.getStore(Parent);
     this.childrenStore = this.world.getStore(Children);
     this.rootQuery = this.world.query(LocalTransform, WorldTransform);
+
+    // A direct write to LocalTransform (moving a turret head, a weapon socket, an attached
+    // prop) must dirty the corresponding WorldTransform so it gets recomputed next update() --
+    // markDirty() exists as a public API but nothing in the engine calls it, so relying on
+    // callers to remember it silently stopped propagation after an entity's first frame. Hook
+    // the store's own write path instead of shadow-copying every LocalTransform field to
+    // detect edits by comparison.
+    this.localStore.onSet((eid) => {
+      if (this.worldStore.has(eid)) this.worldStore.set(eid, "dirty", 1);
+    });
+    // Guarantees a freshly-added WorldTransform gets its first recompute regardless of
+    // whether the caller passed `dirty: 1` explicitly (matching what an uncached entity used
+    // to get for free from the old shadow-cache's "never seen this eid before" check).
+    this.worldStore.onAdd((eid) => {
+      this.worldStore.set(eid, "dirty", 1);
+    });
   }
 
   update(_dt: number): void {
@@ -88,11 +82,10 @@ export class TransformHierarchySystem extends System {
     }
     this.visiting.add(eid);
 
-    // Check dirty flag — skip if clean. "Dirty" is the flag column OR'd with a fresh
-    // cached-value comparison, so a LocalTransform write reaching this entity is caught here
-    // every frame regardless of whether anything remembered to call markDirty().
-    const flagDirty = this.worldStore.get(eid, "dirty") as number;
-    const dirty = (flagDirty !== 0 || this.isLocallyDirty(eid)) ? 1 : 0;
+    // Check dirty flag — skip if clean. Any LocalTransform write reaches this entity's dirty
+    // flag directly (see the store's onSet hook registered in init()), so this single column
+    // read is authoritative without needing to re-compare LocalTransform's fields by hand.
+    const dirty = (this.worldStore.get(eid, "dirty") as number) !== 0 ? 1 : 0;
     const hasDirtyChildren = this.hasDirtyDescendants(eid);
 
     if (dirty === 0 && !hasDirtyChildren && depth > 0) {
@@ -110,12 +103,6 @@ export class TransformHierarchySystem extends System {
     const lsx = this.localStore.get(eid, "sx") as number;
     const lsy = this.localStore.get(eid, "sy") as number;
     const lsz = this.localStore.get(eid, "sz") as number;
-
-    this.ensureLocalCacheCapacity(eid + 1);
-    this.cachedLx[eid] = lx; this.cachedLy[eid] = ly; this.cachedLz[eid] = lz;
-    this.cachedLrx[eid] = lrx; this.cachedLry[eid] = lry; this.cachedLrz[eid] = lrz; this.cachedLrw[eid] = lrw;
-    this.cachedLsx[eid] = lsx; this.cachedLsy[eid] = lsy; this.cachedLsz[eid] = lsz;
-    this.cachedLocalValid[eid] = 1;
 
     tmpPos.set(lx, ly, lz);
     tmpRot.set(lrx, lry, lrz, lrw);
@@ -173,7 +160,7 @@ export class TransformHierarchySystem extends System {
     for (let i = 0; i < childIds.length; i++) {
       const childEid = childIds[i];
       if (childEid === undefined) continue;
-      if (this.worldStore.has(childEid) && (this.worldStore.get(childEid, "dirty") !== 0 || this.isLocallyDirty(childEid))) {
+      if (this.worldStore.has(childEid) && this.worldStore.get(childEid, "dirty") !== 0) {
         return true;
       }
       if (this.hasDirtyDescendants(childEid)) return true;
@@ -181,51 +168,9 @@ export class TransformHierarchySystem extends System {
     return false;
   }
 
-  // True when eid's current LocalTransform values differ from what was cached the last time
-  // this system actually recomputed its WorldTransform (or it's never been cached at all) — a
-  // read-only probe, safe to call from hasDirtyDescendants() without disturbing the cache that
-  // updateEntity() itself updates once it commits to recomputing.
-  private isLocallyDirty(eid: number): boolean {
-    if (eid >= this.localCacheCapacity || this.cachedLocalValid[eid] === 0) return true;
-    const l = this.localStore;
-    return (
-      this.cachedLx[eid] !== (l.get(eid, "x") as number) ||
-      this.cachedLy[eid] !== (l.get(eid, "y") as number) ||
-      this.cachedLz[eid] !== (l.get(eid, "z") as number) ||
-      this.cachedLrx[eid] !== (l.get(eid, "rx") as number) ||
-      this.cachedLry[eid] !== (l.get(eid, "ry") as number) ||
-      this.cachedLrz[eid] !== (l.get(eid, "rz") as number) ||
-      this.cachedLrw[eid] !== (l.get(eid, "rw") as number) ||
-      this.cachedLsx[eid] !== (l.get(eid, "sx") as number) ||
-      this.cachedLsy[eid] !== (l.get(eid, "sy") as number) ||
-      this.cachedLsz[eid] !== (l.get(eid, "sz") as number)
-    );
-  }
-
-  private ensureLocalCacheCapacity(minCapacity: number): void {
-    if (minCapacity <= this.localCacheCapacity) return;
-    let cap = this.localCacheCapacity || INITIAL_LOCAL_CACHE_CAPACITY;
-    while (cap < minCapacity) cap *= 2;
-
-    const grow = (old: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> => {
-      const fresh = new Float32Array(cap);
-      fresh.set(old);
-      return fresh;
-    };
-    this.cachedLx = grow(this.cachedLx); this.cachedLy = grow(this.cachedLy); this.cachedLz = grow(this.cachedLz);
-    this.cachedLrx = grow(this.cachedLrx); this.cachedLry = grow(this.cachedLry); this.cachedLrz = grow(this.cachedLrz); this.cachedLrw = grow(this.cachedLrw);
-    this.cachedLsx = grow(this.cachedLsx); this.cachedLsy = grow(this.cachedLsy); this.cachedLsz = grow(this.cachedLsz);
-
-    const freshValid = new Uint8Array(cap);
-    freshValid.set(this.cachedLocalValid);
-    this.cachedLocalValid = freshValid;
-
-    this.localCacheCapacity = cap;
-  }
-
   // Still a valid, explicit way to force a recompute (e.g. an entity whose WorldTransform needs
   // to be recomputed for a reason other than its own LocalTransform changing) — no longer the
-  // only way dirtiness gets detected, see isLocallyDirty().
+  // only way dirtiness gets detected, see the onSet hook registered in init().
   markDirty(eid: number): void {
     if (this.worldStore.has(eid)) {
       this.worldStore.set(eid, "dirty", 1);

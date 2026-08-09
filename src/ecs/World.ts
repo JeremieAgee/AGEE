@@ -7,7 +7,9 @@ import { ArchetypeIndex } from "./ArchetypeIndex";
 import { SystemScheduler, ExecutionPlan, SystemConstraint } from "./SystemScheduler";
 import type { EngineProfiler } from "../core/EngineProfiler";
 import { Parent } from "../core/HierarchyComponents";
-import { createMask, maskOrBit, maskAndNotBit } from "./ComponentMask";
+import { createMask, maskOrBit, maskAndNotBit, MASK_WORD_COUNT } from "./ComponentMask";
+
+const MAX_COMPONENT_TYPES = MASK_WORD_COUNT * 32;
 
 type EntityCallback = (eid: number) => void;
 
@@ -363,6 +365,16 @@ export class World {
   private getComponentBit(name: string): number {
     let bit = this.componentBits.get(name);
     if (bit === undefined) {
+      // Mask is a fixed-width Uint32Array (see ComponentMask.ts) — a bit index past its
+      // capacity would silently no-op on every mask write instead of throwing, making that
+      // component type invisible to every query with no diagnostic. Fail loudly instead.
+      if (this.nextComponentBit >= MAX_COMPONENT_TYPES) {
+        throw new Error(
+          `[AGEE] Component type limit exceeded: cannot register "${name}" as component type ` +
+          `#${this.nextComponentBit + 1} (limit is ${MAX_COMPONENT_TYPES}). Increase ` +
+          `MASK_WORD_COUNT in src/ecs/ComponentMask.ts.`
+        );
+      }
       bit = this.nextComponentBit;
       this.nextComponentBit++;
       this.componentBits.set(name, bit);

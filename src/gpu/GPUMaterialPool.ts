@@ -50,6 +50,16 @@ function imageSize(source: GPUTexImageSource): { width: number; height: number }
   if (source instanceof HTMLImageElement) {
     return { width: source.naturalWidth || source.width, height: source.naturalHeight || source.height };
   }
+  // HTMLVideoElement exposes videoWidth/videoHeight (its .width/.height are HTML display
+  // attributes, commonly unset since video is usually sized via CSS — falling through to the
+  // generic .width/.height read below would silently produce a degenerate 0x0/1x1 texture).
+  if (typeof HTMLVideoElement !== "undefined" && source instanceof HTMLVideoElement) {
+    return { width: source.videoWidth, height: source.videoHeight };
+  }
+  // VideoFrame exposes displayWidth/displayHeight, not .width/.height.
+  if (typeof VideoFrame !== "undefined" && source instanceof VideoFrame) {
+    return { width: source.displayWidth, height: source.displayHeight };
+  }
   return { width: (source as { width: number }).width, height: (source as { height: number }).height };
 }
 
@@ -207,6 +217,18 @@ export class GPUMaterialPool {
   getMaterialInfo(handle: Handle): GPUMaterialInfo | null {
     const entry = this.entries.get(handle);
     return entry ? { blend: entry.blend, doubleSided: entry.doubleSided } : null;
+  }
+
+  // Non-allocating equivalents of getMaterialInfo() for the per-entity, per-frame draw loop
+  // (GPURenderSystem.update()) — that call site doesn't need a wrapper object, just the two
+  // fields, and building one there for every visible entity every frame was a measurable
+  // amount of avoidable garbage at scale.
+  getBlend(handle: Handle): GPUBlendMode {
+    return this.entries.get(handle)?.blend ?? "opaque";
+  }
+
+  getDoubleSided(handle: Handle): boolean {
+    return this.entries.get(handle)?.doubleSided ?? false;
   }
 
   get defaultBindGroup(): GPUBindGroup {

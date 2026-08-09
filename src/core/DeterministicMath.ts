@@ -89,11 +89,30 @@ export function dacos(x: number): number {
 
 export function dsqrt(x: number): number {
   if (x <= 0) return 0;
-  let guess = x;
-  for (let i = 0; i < 8; i++) {
-    guess = 0.5 * (guess + x / guess);
+  if (!Number.isFinite(x)) return x;
+  // Newton-Raphson only converges within a fixed iteration budget when the initial guess
+  // is close to the true root. Starting from guess=x (as this used to) diverges badly once
+  // x is more than a few thousand, since each step barely halves an over-large guess.
+  // Rescale x into [1, 4) first via exact power-of-4 multiply/divide — exact in IEEE-754,
+  // so it doesn't affect determinism — run the iteration there where it reliably converges
+  // in a handful of steps, then undo the scale.
+  let scale = 1;
+  let scaled = x;
+  let guard = 0;
+  while (scaled >= 4 && guard++ < 1100) {
+    scaled *= 0.25;
+    scale *= 2;
   }
-  return guess;
+  guard = 0;
+  while (scaled < 1 && guard++ < 1100) {
+    scaled *= 4;
+    scale *= 0.5;
+  }
+  let guess = scaled;
+  for (let i = 0; i < 8; i++) {
+    guess = 0.5 * (guess + scaled / guess);
+  }
+  return guess * scale;
 }
 
 export function dabs(x: number): number {

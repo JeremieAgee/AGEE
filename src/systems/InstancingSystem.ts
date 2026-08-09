@@ -230,7 +230,7 @@ export class InstancingSystem extends System {
     tmpVec.set(tx[eid], ty[eid], tz[eid]);
     tmpEuler.set(trx[eid], trY[eid], trz[eid]);
     tmpQuat.setFromEuler(tmpEuler);
-    tmpScale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
+    tmpScale.set(tsx[eid], tsy[eid], tsz[eid]);
     tmpMatrix.compose(tmpVec, tmpQuat, tmpScale);
     mesh.setMatrixAt(index, tmpMatrix);
   }

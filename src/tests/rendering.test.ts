@@ -96,6 +96,7 @@ function makeFakeDevice() {
     createPipelineLayout: vi.fn((desc: any) => ({ __label: desc.label })),
     createShaderModule: vi.fn(() => ({})),
     createRenderPipeline: vi.fn(() => ({})),
+    createRenderPipelineAsync: vi.fn(() => Promise.resolve({})),
     destroy: vi.fn(() => callOrder.push("device.destroy")),
   };
   return { device, callOrder };
@@ -932,6 +933,8 @@ describe("GPURenderSystem: zero-draw-frame / lighting / allocation behavior", ()
       meshRendererStore,
       query: { entities: entityIds },
       pipeline: {},
+      pipelinesReady: true,
+      pipelinesByBlendCull: { opaque: [{}, {}], alpha: [{}, {}], additive: [{}, {}] },
       cameraBuffer: {},
       lightBuffer: {},
       lightInfoBuffer: {},
@@ -1319,7 +1322,10 @@ describe("GPURenderSystem: per-entity matrix cache stays correct when a Transfor
 
     Object.assign(sys as any, {
       gpuCtx, meshPool, _materialPool: materialPool, transformStore, meshRendererStore,
-      query: { entities: [eid] }, pipeline: {}, cameraBuffer: {}, lightBuffer: {}, lightInfoBuffer: {},
+      query: { entities: [eid] }, pipeline: {},
+      pipelinesReady: true,
+      pipelinesByBlendCull: { opaque: [{}, {}], alpha: [{}, {}], additive: [{}, {}] },
+      cameraBuffer: {}, lightBuffer: {}, lightInfoBuffer: {},
       modelBuffer: {}, modelData: new Float32Array(128), perFrameBindGroup: {}, perObjectBindGroup: {},
     });
 

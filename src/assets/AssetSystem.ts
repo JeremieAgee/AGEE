@@ -5,6 +5,7 @@ import { AssetId, AssetType, AssetHandle, LoadStatus, INVALID_ASSET } from "./As
 import { EventBus } from "../core/EventBus";
 import { MemoryBudget } from "../core/MemoryBudget";
 import { ResourceType } from "../core/handles/Handle";
+import { estimateTextureBytes } from "./MemoryEstimates";
 
 // AssetType and ResourceType are separate enums with different numeric values for the same
 // concepts (see AssetTypes.ts / core/handles/Handle.ts) -- this is the only place that needs
@@ -18,14 +19,6 @@ function toResourceType(type: AssetType): ResourceType | null {
     case AssetType.AnimationClip: return ResourceType.AnimClip;
     default: return null; // GLTF/Prefab/Scene are containers, not GPU resources themselves
   }
-}
-
-function estimateTextureBytes(tex: THREE.Texture): number {
-  const img = tex.image as { width?: number; height?: number } | undefined;
-  const w = img?.width ?? 0, h = img?.height ?? 0;
-  // RGBA8 plus ~33% headroom for mipmaps, matching the same rule of thumb ResourceManager
-  // uses elsewhere in the engine for GPU texture memory estimates.
-  return Math.round(w * h * 4 * 1.33);
 }
 
 function estimateAudioBytes(buf: AudioBuffer): number {

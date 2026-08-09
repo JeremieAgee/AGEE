@@ -5,9 +5,9 @@ import { createHUD } from "../shared/hud";
 
 const BRICK_HALF = { x: 0.5, y: 0.25, z: 0.25 }; // full brick = 1 x 0.5 x 0.5
 const BRICK_COLORS = [0xaa5533, 0x9c4a2c, 0xb2603a, 0xa14e2e];
-const WALL_ROWS = 6;
-const WIDTH_HALF = 3; // house footprint: 6 wide (x) x 4 deep (z)
-const DEPTH_HALF = 2;
+const WALL_ROWS = 25;
+const WIDTH_HALF = 12; // house footprint: 24 wide (x) x 16 deep (z) — ~2000 bricks total
+const DEPTH_HALF = 8;
 
 interface HouseBrick {
   eid: number;
@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   const engine = new AGEE({ renderBackend: "webgpu", profiler: true });
   await engine.init();
 
-  createOrbitCamera(engine, { target: { x: 0, y: 2, z: 0 }, distance: 18, height: 6 });
+  createOrbitCamera(engine, { target: { x: 0, y: 6, z: 0 }, distance: 48, height: 20, maxDistance: 100 });
 
   engine.lighting.addAmbientLight(0x334455, 0.4);
   engine.lighting.addDirectionalLight(0xfff2d0, 1.1, { x: 10, y: 14, z: 8 }, true);
@@ -54,23 +54,31 @@ async function main(): Promise<void> {
     // bodyType on an already-registered component, it won't create one for us.
     // High friction / low restitution so the house stands still under gravity and only comes
     // apart when actually struck, instead of jittering itself apart on spawn.
-    engine.world.addComponent(eid, RigidBody, { bodyType: 0, mass: 1, restitution: 0.05, friction: 0.9 });
-    engine.physics.addBody(eid, "dynamic");
+    engine.world.addComponent(eid, RigidBody, { bodyType: 1, mass: 1, restitution: 0.05, friction: 0.9 });
+    // Bricks spawn fixed (immovable) — with ~2000 of them, simulating each as a free dynamic
+    // body every step would be expensive for a structure that's mostly just sitting still.
+    // Rapier skips collision detection between two non-dynamic bodies entirely, so a resting
+    // wall of fixed bricks costs almost nothing. Struck bricks get flipped to dynamic (see
+    // wakeBrick() below) the moment something moving actually touches them.
+    engine.physics.addBody(eid, "fixed");
     engine.physics.addCollider(eid, "box", { halfX: hx, halfY: hy, halfZ: hz });
     return eid;
   }
 
   let house: HouseBrick[] = [];
+  let houseBrickEids = new Set<number>();
 
   function buildHouse(): void {
     for (const brick of house) {
       if (engine.world.isAlive(brick.eid)) engine.world.destroyEntity(brick.eid);
     }
     house = [];
+    houseBrickEids = new Set<number>();
 
     const addBrick = (x: number, y: number, z: number, rotateY: number, hx = BRICK_HALF.x, hy = BRICK_HALF.y, hz = BRICK_HALF.z): void => {
       const eid = createBrick(x, y, z, rotateY, hx, hy, hz);
       house.push({ eid, spawnX: x, spawnY: y, spawnZ: z });
+      houseBrickEids.add(eid);
     };
 
     for (let row = 0; row < WALL_ROWS; row++) {
@@ -98,6 +106,22 @@ async function main(): Promise<void> {
   }
 
   buildHouse();
+
+  // Wake a still-fixed brick into a free dynamic body. Only fires for collisions Rapier
+  // actually reports, which — since fixed-vs-fixed contacts are never detected — means only
+  // the wrecking ball or an already-falling brick can trigger this. That gives the collapse a
+  // natural cascade for free: a struck brick goes dynamic, falls into its still-fixed
+  // neighbors, and wakes them in turn.
+  function wakeBrick(eid: number): void {
+    if (!houseBrickEids.has(eid)) return;
+    houseBrickEids.delete(eid);
+    engine.physics.setBodyType(eid, "dynamic");
+  }
+
+  engine.physics.onCollisionStart(({ entityA, entityB }) => {
+    wakeBrick(entityA);
+    wakeBrick(entityB);
+  });
 
   // Wrecking ball: right-click fires a heavy sphere from the camera along its look direction
   const projectiles: number[] = [];

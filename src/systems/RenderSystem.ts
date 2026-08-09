@@ -127,7 +127,7 @@ export class RenderSystem extends System {
       // one axis is non-zero.
       mesh.rotation.order = "ZYX";
       mesh.rotation.set(trx[eid], trY[eid], trz[eid]);
-      mesh.scale.set(tsx[eid] || 1, tsy[eid] || 1, tsz[eid] || 1);
+      mesh.scale.set(tsx[eid], tsy[eid], tsz[eid]);
       // AUDIT FIX (bug #1): CullingSystem (priority 800) runs before this system
       // (priority 900, same "render" phase) and computes real frustum-culling
       // visibility into mesh.visible. Previously this line unconditionally

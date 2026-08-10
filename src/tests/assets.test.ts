@@ -6,6 +6,7 @@ import { AssetStore } from "../assets/AssetStore";
 import { AssetSystem } from "../assets/AssetSystem";
 import { AssetType, LoadStatus, INVALID_ASSET } from "../assets/AssetTypes";
 import { GLTFPipeline } from "../assets/pipeline/GLTFPipeline";
+import { ResourceType } from "../core/handles/Handle";
 
 // ---------------------------------------------------------------------------
 // AssetStore — direct SOA store correctness
@@ -90,7 +91,7 @@ describe("AssetSystem.load (texture path, single owner)", () => {
       function (this: any, url: string, onLoad?: (t: any) => void) {
         let tex = textures.get(url);
         if (!tex) {
-          tex = { dispose: vi.fn(), url };
+          tex = { dispose: vi.fn(), url, image: { width: 8, height: 8 } };
           textures.set(url, tex);
         }
         onLoad?.(tex);
@@ -213,6 +214,42 @@ describe("AssetSystem.load (texture path, single owner)", () => {
     // The asset must still be alive: owner A has not released its reference yet.
     expect(sys.isReady(handle)).toBe(true);
     expect(sys.store.getData(handle)).not.toBeNull();
+  });
+
+  // AUDIT FIX: evictLRU() previously had no caller outside its own unit test — isOverBudget()
+  // only produced a console.warn, so a long streaming session kept allocating past the
+  // configured budget forever. AssetSystem now evicts the least-recently-used single-owner
+  // asset of the over-budget type as soon as loading pushes usage past it.
+  it("evicts the least-recently-used single-owner texture once the texture budget is exceeded", async () => {
+    const sys = new AssetSystem();
+    sys.memoryBudget.setBudget(ResourceType.Texture, 1);
+
+    const h1 = sys.registerTexture("lru1", "textures/lru1.png");
+    const oldData = await sys.load(h1);
+
+    const h2 = sys.registerTexture("lru2", "textures/lru2.png");
+    await sys.load(h2);
+
+    // h1 is the older, single-owner (refCount 1) entry, so it's the one evicted to make room
+    // for h2 — not h2 itself, which must survive its own load.
+    expect(oldData.dispose).toHaveBeenCalledTimes(1);
+    expect(sys.store.getHandleById("lru1")).toBe(INVALID_ASSET);
+    expect(sys.isReady(h2)).toBe(true);
+  });
+
+  it("does not evict a texture still held by two owners", async () => {
+    const sys = new AssetSystem();
+    sys.memoryBudget.setBudget(ResourceType.Texture, 1);
+
+    const h1 = sys.registerTexture("shared-lru", "textures/shared-lru.png");
+    const data = await sys.load(h1);
+    await sys.load(h1); // second owner -> refCount 2, ineligible for eviction
+
+    const h2 = sys.registerTexture("lru3", "textures/lru3.png");
+    await sys.load(h2);
+
+    expect(data.dispose).not.toHaveBeenCalled();
+    expect(sys.isReady(h1)).toBe(true);
   });
 });
 

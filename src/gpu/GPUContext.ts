@@ -17,9 +17,16 @@ export class GPUContext {
   private _width = 0;
   private _height = 0;
   private ownsCanvas = false;
+  private _lost = false;
 
   get width(): number { return this._width; }
   get height(): number { return this._height; }
+  // GPURenderSystem.update() checks this every frame and cleanly stops presenting once it's
+  // true, instead of calling into a dead device. No automatic device re-creation is attempted
+  // here -- that would mean rebuilding every GPU resource this context's consumers hold
+  // (buffers, pipelines, meshes, materials) from scratch, which is a much larger, riskier
+  // change than this fix's scope; this is the "stop trying, don't crash" minimum.
+  get lost(): boolean { return this._lost; }
 
   private constructor(
     adapter: GPUAdapter,
@@ -51,10 +58,6 @@ export class GPUContext {
       requiredFeatures: config.requiredFeatures,
     });
 
-    device.lost.then((info) => {
-      console.error("[GPUContext] Device lost:", info.message);
-    });
-
     const canvas = config.canvas ?? document.createElement("canvas");
     if (!config.canvas) {
       canvas.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;display:none;pointer-events:none;z-index:1;";
@@ -77,6 +80,15 @@ export class GPUContext {
 
     const ctx = new GPUContext(adapter, device, canvas, canvasContext, format);
     ctx.ownsCanvas = !config.canvas;
+
+    device.lost.then((info) => {
+      // "destroyed" fires as the expected result of this context's own destroy() calling
+      // device.destroy() during normal teardown -- not a real loss, so don't log it as an
+      // error or leave `lost` set for a context that's simply being torn down on purpose.
+      if (info.reason === "destroyed") return;
+      ctx._lost = true;
+      console.error("[GPUContext] Device lost unexpectedly:", info.message);
+    });
 
     const dpr = window.devicePixelRatio || 1;
     ctx.resize(

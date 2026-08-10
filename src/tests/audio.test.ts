@@ -145,6 +145,28 @@ describe("AudioSystem", () => {
     expect(sound.position.z).toBe(3);
   });
 
+  it("update() propagates a spatial sound's position into matrixWorld so the WebAudio panner reads fresh values", () => {
+    // Regression test: PositionalAudio's panner reads matrixWorld (recomputed only when the
+    // scene graph is traversed via updateMatrixWorld), not .position directly. A detached
+    // node whose .position is set but whose matrixWorld is never refreshed would play at the
+    // right volume/loop but always pan as if centered on the listener. Asserting on
+    // matrixWorld (rather than just .position, which passes even when panning is broken)
+    // is what actually catches that class of bug.
+    const { world, audio } = makeSystem();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 5, y: -2, z: 9, sx: 1, sy: 1, sz: 1 });
+    const sound = audio.createSound(eid, fakeAudioBuffer(), { spatial: true });
+    audio.play(eid);
+
+    audio.update(0);
+
+    const e = sound.matrixWorld.elements;
+    // Matrix4.elements is column-major; the translation column is indices 12/13/14.
+    expect(e[12]).toBeCloseTo(5);
+    expect(e[13]).toBeCloseTo(-2);
+    expect(e[14]).toBeCloseTo(9);
+  });
+
   it("destroy() stops and disconnects all active sounds", () => {
     const { world, audio } = makeSystem();
     const eid = world.createEntity();

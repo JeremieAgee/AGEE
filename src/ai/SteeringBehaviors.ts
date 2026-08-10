@@ -213,7 +213,12 @@ export class SteeringSystem extends System {
 
       if (flags & SteeringFlag.Pursue) {
         const tEid = tgtEids[eid];
-        if (tEid >= 0) {
+        // Guard against a stale/recycled targetEid the same way AISystem.updatePerception()
+        // only ever considers entities that actually have a Transform -- without this, reading
+        // tx/ty/tz[tEid] straight off the raw column for a destroyed-and-recycled entity id
+        // silently pursues garbage or a stale leftover position instead of disabling the
+        // behavior for the tick.
+        if (tEid >= 0 && this.transformStore.has(tEid)) {
           const tpx = tx[tEid], tpy = ty[tEid], tpz = tz[tEid];
           let tvx = 0, tvz = 0;
           if (this.steerStore.has(tEid)) {
@@ -236,7 +241,8 @@ export class SteeringSystem extends System {
 
       if (flags & SteeringFlag.Evade) {
         const tEid = tgtEids[eid];
-        if (tEid >= 0) {
+        // Same stale/recycled-entity guard as Pursue above.
+        if (tEid >= 0 && this.transformStore.has(tEid)) {
           const tpx = tx[tEid], tpz = tz[tEid];
           let tvx = 0, tvz = 0;
           if (this.steerStore.has(tEid)) {

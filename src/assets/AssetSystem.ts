@@ -3,8 +3,8 @@ import { System } from "../ecs";
 import { AssetStore } from "./AssetStore";
 import { AssetId, AssetType, AssetHandle, LoadStatus, INVALID_ASSET } from "./AssetTypes";
 import { EventBus } from "../core/EventBus";
-import { MemoryBudget } from "../core/MemoryBudget";
-import { ResourceType } from "../core/handles/Handle";
+import { MemoryBudget, type EvictionSource } from "../core/MemoryBudget";
+import { ResourceType, handleIndex } from "../core/handles/Handle";
 import { estimateTextureBytes } from "./MemoryEstimates";
 
 // AssetType and ResourceType are separate enums with different numeric values for the same
@@ -42,8 +42,57 @@ export class AssetSystem extends System {
   private events: EventBus | null = null;
   private inflight = new Map<AssetHandle, Promise<any>>();
 
+  constructor() {
+    super();
+    // The only place evictLRU()'s picks actually get disposed -- evictLRU itself only tracks
+    // the deallocation and returns the handles, it doesn't know how to free a Texture/AudioBuffer
+    // or remove the slot from AssetStore.
+    this.memoryBudget.onEviction((handle) => this.disposeEvicted(handle as AssetHandle));
+  }
+
   setEvents(events: EventBus): void {
     this.events = events;
+  }
+
+  private disposeEvicted(handle: AssetHandle): void {
+    const data = this.store.getData(handle);
+    if (data?.dispose) data.dispose();
+    this.store.remove(handle);
+    this.events?.emit("asset:evicted", handle);
+  }
+
+  // AUDIT FIX: previously isOverBudget() only produced a console.warn -- the configured budget
+  // was a diagnostic, not a ceiling, since nothing ever called evictLRU(). Evicts the
+  // least-recently-used *other* loaded assets of this type to make room, not the asset that was
+  // just loaded (which is why this runs before that asset's own retain in the caller established
+  // it as "in use" -- eviction only ever targets assets with refCount <= 1, i.e. not held by a
+  // second independent owner beyond the original loader).
+  private evictIfOverBudget(type: ResourceType, typeName: string, path: string, justLoaded: AssetHandle): void {
+    if (!this.memoryBudget.isOverBudget(type)) return;
+    const overage = this.memoryBudget.getUsage(type) - this.memoryBudget.getBudget(type);
+    // Exclude the asset that was just loaded from its own eviction pass -- otherwise a single
+    // asset whose size alone exceeds the budget (or the only loaded asset of this type) would
+    // be sorted as its own oldest/only LRU candidate and evict itself before load()'s promise
+    // even resolves, handing the caller a disposed, store-removed handle.
+    const excludeIndex = handleIndex(justLoaded);
+    const source: EvictionSource = {
+      // AssetStore speaks AssetType (its own vocabulary); evictLRU expects ResourceType (a
+      // separate enum with different numeric values for the same concepts -- see
+      // toResourceType above) so each entry's type is translated on the way through.
+      forEachEntry: (callback) => this.store.forEachEntry((entry, index) => {
+        if (index === excludeIndex) return;
+        const resourceType = toResourceType(entry.resourceType);
+        if (resourceType === null) return;
+        callback({ ...entry, resourceType }, index);
+      }),
+      handleAt: (index) => this.store.handleAt(index),
+    };
+    const evicted = this.memoryBudget.evictLRU(source, type, overage);
+    if (evicted.length === 0) {
+      // Nothing evictable (every loaded asset of this type is retained by 2+ owners) -- still
+      // surface that the budget is exceeded and staying that way.
+      console.warn(`[AGEE] ${typeName} memory budget exceeded after loading "${path}" (${(this.memoryBudget.getUsage(type) / 1024 / 1024).toFixed(1)}MB used) and nothing was evictable.`);
+    }
   }
 
   // ── Register + Load ──
@@ -191,9 +240,7 @@ export class AssetSystem extends System {
           const bytes = estimateTextureBytes(tex);
           this.store.setMemorySize(handle, bytes);
           this.memoryBudget.trackAllocation(ResourceType.Texture, bytes);
-          if (this.memoryBudget.isOverBudget(ResourceType.Texture)) {
-            console.warn(`[AGEE] Texture memory budget exceeded after loading "${path}" (${(this.memoryBudget.getUsage(ResourceType.Texture) / 1024 / 1024).toFixed(1)}MB used).`);
-          }
+          this.evictIfOverBudget(ResourceType.Texture, "Texture", path, handle);
           this.events?.emit("asset:loaded", handle);
           resolve(tex);
         },
@@ -216,9 +263,7 @@ export class AssetSystem extends System {
           const bytes = estimateAudioBytes(buf);
           this.store.setMemorySize(handle, bytes);
           this.memoryBudget.trackAllocation(ResourceType.Audio, bytes);
-          if (this.memoryBudget.isOverBudget(ResourceType.Audio)) {
-            console.warn(`[AGEE] Audio memory budget exceeded after loading "${path}" (${(this.memoryBudget.getUsage(ResourceType.Audio) / 1024 / 1024).toFixed(1)}MB used).`);
-          }
+          this.evictIfOverBudget(ResourceType.Audio, "Audio", path, handle);
           this.events?.emit("asset:loaded", handle);
           resolve(buf);
         },

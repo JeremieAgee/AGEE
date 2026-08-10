@@ -41,6 +41,17 @@ export class ComponentRegistry {
   private defs: ComponentDef[] = [];
   private nameToIndex = new Map<string, number>();
 
+  // AUDIT FIX (allocation pressure in the decode hot path): getSerializableFields() only
+  // depends on `def` (fixed once a component is registered), but was previously recomputed --
+  // allocating a fresh array -- on every single call, including once per component per entity
+  // for every Snapshot/DeltaSnapshot read and write. Under a sustained stream of dense messages
+  // that's a lot of steady-state garbage for a value that never changes after registration.
+  // Cached by def reference (a WeakMap costs nothing extra once defs are GC'd, and avoids ever
+  // returning a stale array for a def that gets re-registered under the same name). The
+  // returned array is never mutated by callers (only read via indexOf/index access), so sharing
+  // one instance across calls is safe.
+  private serializableFieldsCache = new WeakMap<ComponentDef, string[]>();
+
   register(...defs: ComponentDef[]): void {
     for (const def of defs) {
       if (this.nameToIndex.has(def.name)) continue;
@@ -65,10 +76,14 @@ export class ComponentRegistry {
   }
 
   getSerializableFields(def: ComponentDef): string[] {
+    const cached = this.serializableFieldsCache.get(def);
+    if (cached) return cached;
+
     const fields: string[] = [];
     for (const [field, type] of Object.entries(def.schema)) {
       if (type !== "ref") fields.push(field);
     }
+    this.serializableFieldsCache.set(def, fields);
     return fields;
   }
 }

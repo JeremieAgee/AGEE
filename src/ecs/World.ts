@@ -6,6 +6,7 @@ import { System, SystemPhase } from "./System";
 import { ArchetypeIndex } from "./ArchetypeIndex";
 import { SystemScheduler, ExecutionPlan, SystemConstraint } from "./SystemScheduler";
 import type { EngineProfiler } from "../core/EngineProfiler";
+import type { ValidationLayer } from "../core/ValidationLayer";
 import { Parent } from "../core/HierarchyComponents";
 import { createMask, maskOrBit, maskAndNotBit, MASK_WORD_COUNT } from "./ComponentMask";
 
@@ -46,6 +47,7 @@ export class World {
   private _alive = new BitSet();
   private destroyCallbacks: EntityCallback[] = [];
   private readonly initialCapacity: number;
+  private validation: ValidationLayer | null = null;
 
   // Reverse index (parent eid -> child eids) kept in sync via the Parent store's onAdd/onRemove
   // hooks, so destroyEntity's dangling-Parent cleanup doesn't have to linear-scan every entity
@@ -108,7 +110,10 @@ export class World {
   }
 
   destroyEntity(eid: number): void {
-    if (!this._alive.has(eid)) return;
+    if (!this._alive.has(eid)) {
+      this.validation?.checkEntityAlive(eid, "World.destroyEntity", (e) => this._alive.has(e));
+      return;
+    }
     this.flags[eid] |= EntityFlags.DestroyPending;
 
     for (let i = 0; i < this.destroyCallbacks.length; i++) {
@@ -133,8 +138,19 @@ export class World {
     this.recycled.push(eid);
   }
 
-  isAlive(eid: number): boolean {
-    return this._alive.has(eid);
+  setValidation(validation: ValidationLayer | null): void {
+    this.validation = validation;
+  }
+
+  // `generation` is optional so this stays a drop-in replacement for the existing bare-eid
+  // check. When supplied (a system stored it alongside the raw id, e.g. an AI target or network
+  // owner ref), this also rejects a live-but-recycled id that now belongs to a different entity
+  // than the one the caller originally referenced -- the same staleness Parent.entity gets for
+  // free via cleanupDanglingParentRefs, generalized so other systems can opt into it too.
+  isAlive(eid: number, generation?: number): boolean {
+    if (!this._alive.has(eid)) return false;
+    if (generation !== undefined && this.generations[eid] !== generation) return false;
+    return true;
   }
 
   get entityCount(): number {
@@ -216,7 +232,10 @@ export class World {
     def: ComponentDef<S>,
     data?: Partial<Record<keyof S, number | boolean | any>>
   ): void {
-    if (!this._alive.has(eid)) return;
+    if (!this._alive.has(eid)) {
+      this.validation?.checkEntityAlive(eid, "World.addComponent", (e) => this._alive.has(e));
+      return;
+    }
 
     const store = this.getStore(def);
     const hadComponent = store.has(eid);
@@ -230,7 +249,10 @@ export class World {
     // Without this, a stale eid held past destroyEntity() + recycle can silently mutate
     // whichever new entity has since been handed that same recycled id — mirrors the
     // isAlive() guard addComponent() already applies.
-    if (!this._alive.has(eid)) return;
+    if (!this._alive.has(eid)) {
+      this.validation?.checkEntityAlive(eid, "World.removeComponent", (e) => this._alive.has(e));
+      return;
+    }
 
     const store = this.getStore(def);
     if (!store.has(eid)) return;
@@ -324,6 +346,20 @@ export class World {
   }
 
   clear(): void {
+    // Without this, clear() wiped every component store directly and skipped destroyEntity()
+    // entirely, so registered onEntityDestroy callbacks (Engine's Three.js mesh/light disposal,
+    // GPU mesh/material release, cleanupDanglingParentRefs below) never ran for any entity still
+    // alive at teardown -- a real leak, not just a missed hook.
+    for (const eid of this._alive.toArray()) {
+      for (let i = 0; i < this.destroyCallbacks.length; i++) {
+        try {
+          this.destroyCallbacks[i](eid);
+        } catch (e) {
+          console.error(`[AGEE] Entity destroy callback threw for entity ${eid}:`, e);
+        }
+      }
+    }
+
     for (const system of this.systems) {
       system.destroy?.();
     }

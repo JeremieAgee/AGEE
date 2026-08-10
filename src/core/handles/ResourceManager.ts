@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { Handle, HandleMap, ResourceType, INVALID_HANDLE } from "./Handle";
+import type { ValidationLayer } from "../ValidationLayer";
 
 export type TextureHandle = Handle & { __brand: "texture" };
 export type MeshHandle = Handle & { __brand: "mesh" };
@@ -21,6 +22,7 @@ export class ResourceManager {
   private resources = new HandleMap<any>();
   private memoryBudget = Infinity;
   private _peakMemory = 0;
+  private validation: ValidationLayer | null = null;
 
   get peakMemory(): number { return this._peakMemory; }
 
@@ -28,9 +30,14 @@ export class ResourceManager {
     this.memoryBudget = bytes;
   }
 
+  setValidation(validation: ValidationLayer | null): void {
+    this.validation = validation;
+  }
+
   // ── Textures ──
   addTexture(tex: THREE.Texture, memorySize: number = 0): TextureHandle {
     const h = this.resources.alloc(tex, ResourceType.Texture, memorySize) as TextureHandle;
+    this.validation?.trackAllocation(h, "texture");
     this.trackPeakMemory();
     return h;
   }
@@ -42,6 +49,7 @@ export class ResourceManager {
   // ── Meshes (BufferGeometry) ──
   addMesh(geo: THREE.BufferGeometry, memorySize: number = 0): MeshHandle {
     const h = this.resources.alloc(geo, ResourceType.Mesh, memorySize) as MeshHandle;
+    this.validation?.trackAllocation(h, "mesh");
     this.trackPeakMemory();
     return h;
   }
@@ -53,6 +61,7 @@ export class ResourceManager {
   // ── Materials ──
   addMaterial(mat: THREE.Material, memorySize: number = 0): MaterialHandle {
     const h = this.resources.alloc(mat, ResourceType.Material, memorySize) as MaterialHandle;
+    this.validation?.trackAllocation(h, "material");
     this.trackPeakMemory();
     return h;
   }
@@ -64,6 +73,7 @@ export class ResourceManager {
   // ── Audio ──
   addAudio(buf: AudioBuffer, memorySize: number = 0): AudioHandle {
     const h = this.resources.alloc(buf, ResourceType.Audio, memorySize || estimateAudioSize(buf)) as AudioHandle;
+    this.validation?.trackAllocation(h, "audio");
     this.trackPeakMemory();
     return h;
   }
@@ -74,7 +84,9 @@ export class ResourceManager {
 
   // ── Animation Clips ──
   addAnimClip(clip: THREE.AnimationClip): AnimClipHandle {
-    return this.resources.alloc(clip, ResourceType.AnimClip, 0) as AnimClipHandle;
+    const h = this.resources.alloc(clip, ResourceType.AnimClip, 0) as AnimClipHandle;
+    this.validation?.trackAllocation(h, "animClip");
+    return h;
   }
 
   getAnimClip(h: AnimClipHandle): THREE.AnimationClip | null {
@@ -89,12 +101,14 @@ export class ResourceManager {
   }
 
   release(h: Handle): void {
+    this.validation?.checkNoDoubleRelease(h, "ResourceManager.release");
     const remaining = this.resources.release(h);
     if (remaining < 0) {
       console.warn(`[AGEE] ResourceManager.release() called on invalid handle ${h}`);
       return;
     }
     if (remaining === 0) {
+      this.validation?.trackDeallocation(h);
       this.disposeHandle(h);
     }
   }
@@ -161,6 +175,12 @@ export class ResourceManager {
   }
 
   disposeAll(): void {
+    if (this.validation) {
+      this.resources.forEachEntry((_entry, index) => {
+        const h = this.resources.handleAt(index);
+        if (h !== null) this.validation!.trackDeallocation(h);
+      });
+    }
     this.resources.forEach((data) => {
       if (data && typeof data.dispose === "function") data.dispose();
     });

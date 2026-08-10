@@ -256,8 +256,19 @@ export class TerrainSystem extends System {
     // Resume any fallback build left mid-chunk by a previous frame before starting new work —
     // finish what's in flight first, same as the worker path would eventually resolve its
     // outstanding request.
+    //
+    // AUDIT FIX: a resumed job wasn't re-checked against wantedChunks until it finished, unlike
+    // the async worker path (see onChunkBuilt), so a fast camera pan/180 turn could leave
+    // several large in-flight builds queued for chunks no longer visible — every subsequent
+    // frame then spent its whole maxChunkLoadMs budget finishing them before any newly-visible
+    // chunk got a slot. Drop a job here the same way onChunkBuilt already drops a stale worker
+    // response, instead of spending budget on it.
     while (this.slicedBuildQueue.length > 0) {
       const job = this.slicedBuildQueue.shift()!;
+      if (!this.wantedChunks.has(job.key)) {
+        this.loadingChunks.delete(job.key);
+        continue;
+      }
       this.runSlicedBuild(job, deadline);
       if (performance.now() >= deadline) break;
     }

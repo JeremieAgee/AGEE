@@ -13,9 +13,15 @@ const PERCEPTION_KEYS = [
   "targetLastZ",
 ] as const;
 
-// Copies the shared perception keys from `blackboard` into `dst` if a target has been
-// perceived, e.g. GOAPInstance.worldState or UtilityInstance.blackboard. No-op if the entity
-// currently has no target (dst keeps whatever it last held).
+// Copies the shared perception keys from `blackboard` into `dst`, e.g. GOAPInstance.worldState
+// or UtilityInstance.blackboard. The guard below is keyed on whether "hasTarget" was ever
+// *set* on the blackboard (i.e. whether AISystem bridged a Perception component onto it at
+// all, see AISystem.update()) -- not on its current true/false *value* -- so this syncs live
+// state (including alertLevel and the targetLastX/Y/Z "last known position" fields, which stay
+// meaningful for last-known-location reasoning even after a target is lost) on every tick the
+// entity has Perception, regardless of whether hasTarget is currently true or false. It's a
+// no-op only when the entity has no Perception component bridged onto the blackboard at all
+// (dst keeps whatever it last held).
 export function syncPerceptionState(dst: Map<string, any>, blackboard?: Blackboard | null): void {
   if (!blackboard?.has("hasTarget")) return;
   for (const key of PERCEPTION_KEYS) {

@@ -1,5 +1,5 @@
 import { AssetId, AssetType, LoadStatus, AssetHandle, INVALID_ASSET } from "./AssetTypes";
-import { HandleAllocator, handleIndex } from "../core/handles/Handle";
+import { HandleAllocator, handleIndex, makeHandle } from "../core/handles/Handle";
 
 const INITIAL_CAPACITY = 256;
 
@@ -14,6 +14,7 @@ export class AssetStore {
   private _dependencies: number[][];
   private _errors: (string | null)[];
   private _memorySize: Float64Array;
+  private _lastAccess: Float64Array;
 
   private capacity: number;
   // Generational allocator (index + generation packed into the handle) instead of a bare
@@ -40,6 +41,7 @@ export class AssetStore {
     this._dependencies = new Array(capacity).fill(null).map(() => []);
     this._errors = new Array(capacity).fill(null);
     this._memorySize = new Float64Array(capacity);
+    this._lastAccess = new Float64Array(capacity);
   }
 
   register(id: AssetId, type: AssetType, path: string): AssetHandle {
@@ -89,6 +91,7 @@ export class AssetStore {
     this._status[slot] = LoadStatus.Loaded;
     this._data[slot] = data;
     this._errors[slot] = null;
+    this._lastAccess[slot] = performance.now();
   }
 
   setFailed(handle: AssetHandle, error: string): void {
@@ -132,7 +135,12 @@ export class AssetStore {
   getStatus(handle: AssetHandle): LoadStatus { return this.isValid(handle) ? this._status[handleIndex(handle)] : LoadStatus.Unloaded; }
   getRefCount(handle: AssetHandle): number { return this.isValid(handle) ? this._refCount[handleIndex(handle)] : 0; }
   getPath(handle: AssetHandle): string { return this.isValid(handle) ? this._paths[handleIndex(handle)] : ""; }
-  getData<T = any>(handle: AssetHandle): T | null { return this.isValid(handle) ? this._data[handleIndex(handle)] : null; }
+  getData<T = any>(handle: AssetHandle): T | null {
+    if (!this.isValid(handle)) return null;
+    const slot = handleIndex(handle);
+    this._lastAccess[slot] = performance.now();
+    return this._data[slot];
+  }
   getError(handle: AssetHandle): string | null { return this.isValid(handle) ? this._errors[handleIndex(handle)] : null; }
   getDependencies(handle: AssetHandle): number[] { return this.isValid(handle) ? this._dependencies[handleIndex(handle)] : []; }
 
@@ -161,6 +169,30 @@ export class AssetStore {
     });
   }
 
+  /** Only visits Loaded slots -- an eviction pass has nothing to free from a slot that's still
+   *  Unloaded/Loading/Failed. `entry.resourceType` stays an AssetType (this module's own
+   *  vocabulary); callers that need MemoryBudget's ResourceType (a separate enum -- see
+   *  AssetSystem's toResourceType) translate it themselves. */
+  forEachEntry(callback: (entry: { resourceType: AssetType; refCount: number; memorySize: number; lastAccess: number }, index: number) => void): void {
+    this.idToHandle.forEach((handle) => {
+      const slot = handleIndex(handle);
+      if (this._status[slot] !== LoadStatus.Loaded) return;
+      callback({
+        resourceType: this._types[slot],
+        refCount: this._refCount[slot],
+        memorySize: this._memorySize[slot],
+        lastAccess: this._lastAccess[slot],
+      }, slot);
+    });
+  }
+
+  /** Reconstructs a valid AssetHandle for a live Loaded slot found via forEachEntry, where only
+   *  the raw SOA index is available -- mirrors HandleMap.handleAt(). */
+  handleAt(index: number): AssetHandle | null {
+    if (this._status[index] !== LoadStatus.Loaded) return null;
+    return makeHandle(index, this.allocator.generationAt(index)) as AssetHandle;
+  }
+
   get activeCount(): number { return this.allocator.activeCount; }
 
   remove(handle: AssetHandle): any {
@@ -179,6 +211,7 @@ export class AssetStore {
     this._dependencies[slot] = [];
     this._errors[slot] = null;
     this._memorySize[slot] = 0;
+    this._lastAccess[slot] = 0;
 
     this.idToHandle.delete(id);
     this.pathToId.delete(path);
@@ -198,11 +231,13 @@ export class AssetStore {
     const newStatus = new Uint8Array(newCap); newStatus.set(this._status);
     const newRef = new Uint32Array(newCap); newRef.set(this._refCount);
     const newMemorySize = new Float64Array(newCap); newMemorySize.set(this._memorySize);
+    const newLastAccess = new Float64Array(newCap); newLastAccess.set(this._lastAccess);
 
     this._types = newTypes;
     this._status = newStatus;
     this._refCount = newRef;
     this._memorySize = newMemorySize;
+    this._lastAccess = newLastAccess;
     this._ids.length = newCap;
     this._paths.length = newCap;
     this._data.length = newCap;

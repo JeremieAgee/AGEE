@@ -12,6 +12,7 @@ import { HandleMap } from "../core/handles/Handle";
 
 import { World } from "../ecs/World";
 import { Transform, MeshRenderer, GPUMeshRenderer } from "../core/Components";
+import { LocalTransform, WorldTransform, Children } from "../core/HierarchyComponents";
 
 import { CullingSystem } from "../systems/CullingSystem";
 // RenderSystem itself is imported dynamically (see beforeAll below) — its module
@@ -21,6 +22,10 @@ import { CullingSystem } from "../systems/CullingSystem";
 import { InstancingSystem, InstancedTag } from "../systems/InstancingSystem";
 import { LODSystem, LODGroup, type LODLevel } from "../systems/LODSystem";
 import { CameraSystem, CameraData, CameraMode } from "../camera/CameraSystem";
+// TransformHierarchySystem imports only ecs/HierarchyComponents/Mat4-Vec3-Quat, none of
+// which touch "three/webgpu" or DOM globals at import time, so unlike RenderSystem above it's
+// safe to import statically here.
+import { TransformHierarchySystem } from "../systems/TransformHierarchySystem";
 
 import { GPUMesh } from "../gpu/GPUMesh";
 import { GPUMaterialPool } from "../gpu/GPUMaterialPool";
@@ -153,6 +158,65 @@ describe("Culling: Frustum-vs-AABB decisions", () => {
     // Near plane sits at world z = 5 - 0.1 = 4.9. This box spans z=4..6, straddling it.
     const aabb = new AABB(new Vec3(-0.2, -0.2, 4), new Vec3(0.2, 0.2, 6));
     expect(frustum.intersectsAABB(aabb)).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Frustum: NDC z-range convention parameter (LOW audit finding) -- near-plane extraction
+// differs between OpenGL's -1..1 clip-space z range (THREE's default) and WebGPU/D3D's 0..1
+// range (this engine's own native Mat4.perspective()/orthographic()); see Frustum.ts.
+// ===========================================================================
+
+describe("Frustum: NDC z-range convention (0..1 WebGPU-native vs -1..1 OpenGL-style)", () => {
+  // Pure projection, no view transform -- camera effectively at the origin looking down -Z,
+  // so a point's world z IS its view-space depth, making near-plane boundary math exact.
+  function nativeProj(): Mat4 {
+    return new Mat4().perspective((90 * Math.PI) / 180, 1, 0.1, 100);
+  }
+
+  it("ndcZRange='0..1' correctly excludes a point nearer than `near` from a native (WebGPU-range) projection matrix", () => {
+    const frustum = new Frustum().setFromProjectionMatrix(nativeProj().elements, "0..1");
+    // z=-0.07 is closer to the camera than near=0.1 -> must be culled.
+    expect(frustum.containsPoint(new Vec3(0, 0, -0.07))).toBe(false);
+    // z=-0.2 is safely behind the near plane -> included.
+    expect(frustum.containsPoint(new Vec3(0, 0, -0.2))).toBe(true);
+  });
+
+  it("the default (-1..1) formula misclassifies that same near-plane point when fed a 0..1-range matrix, showing why the parameter matters", () => {
+    // No ndcZRange passed -> defaults to "-1..1", preserving old behavior for existing callers
+    // (all of whom feed THREE's own -1..1-range matrices) -- but that default is wrong for this
+    // engine's own native (0..1) projection matrices, exactly the landmine this test documents.
+    const frustum = new Frustum().setFromProjectionMatrix(nativeProj().elements);
+    expect(frustum.containsPoint(new Vec3(0, 0, -0.07))).toBe(true);
+  });
+});
+
+// ===========================================================================
+// TransformHierarchySystem: cycle protection (MEDIUM audit finding) -- hasDirtyDescendants()
+// runs before updateEntity()'s own `visiting` cycle guard applies, so it needs its own.
+// ===========================================================================
+
+describe("TransformHierarchySystem: cycle protection in hasDirtyDescendants", () => {
+  it("does not stack-overflow when Children arrays form a cycle", () => {
+    const world = new World();
+    const a = world.createEntity();
+    const b = world.createEntity();
+
+    world.addComponent(a, LocalTransform, { x: 0, y: 0, z: 0, rw: 1, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(a, WorldTransform, {});
+    world.addComponent(b, LocalTransform, { x: 0, y: 0, z: 0, rw: 1, sx: 1, sy: 1, sz: 1 });
+    world.addComponent(b, WorldTransform, {});
+
+    // Cycle purely through Children arrays (hasDirtyDescendants only reads Children, not
+    // Parent, so no Parent component is even needed to trigger the old unbounded recursion).
+    world.addComponent(a, Children, { entities: [b] });
+    world.addComponent(b, Children, { entities: [a] });
+
+    const sys = new TransformHierarchySystem();
+    sys.world = world;
+    sys.init();
+
+    expect(() => sys.update(1 / 60)).not.toThrow();
   });
 });
 
@@ -292,6 +356,37 @@ describe("CullingSystem: visibility decisions", () => {
     // reverting the culling decision every single frame.
     expect(meshObj.visible).toBe(false);
   });
+
+  // -------------------------------------------------------------------------
+  // AUDIT FIX: subtreeBoundsCache is keyed by eid and holds a THREE.Object3D reference --
+  // without pruning it on entity destroy, it grows forever and keeps destroyed entities'
+  // meshes from being GC'd. See CullingSystem.onEntityDestroyed().
+  // -------------------------------------------------------------------------
+  it("AUDIT: subtreeBoundsCache entry is dropped when its owning entity is destroyed", () => {
+    const world = new World();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+
+    // A container with children but no geometry of its own exercises the
+    // getSubtreeWorldBox() cache path (subtreeBoundsCache) -- a plain Mesh doesn't.
+    const group = new THREE.Group();
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()));
+
+    world.addComponent(eid, MeshRenderer, { meshRef: group, visible: 1, castShadow: 0, receiveShadow: 0 });
+    world.addComponent(eid, GPUMeshRenderer, { meshHandle: 0, materialHandle: 0, visible: 1, castShadow: 0, receiveShadow: 0 });
+
+    const culling = new CullingSystem();
+    culling.world = world;
+    culling.init();
+    culling.setCamera(makeCamera());
+    culling.update(1 / 60);
+
+    expect((culling as any).subtreeBoundsCache.has(eid)).toBe(true);
+
+    world.destroyEntity(eid);
+
+    expect((culling as any).subtreeBoundsCache.has(eid)).toBe(false);
+  });
 });
 
 // ===========================================================================
@@ -371,6 +466,47 @@ describe("LODSystem: distance-threshold level selection", () => {
     camera.position.z = 8;
     lod.update(1 / 60);
     expect(world.getStore(LODGroup).get(eid, "currentLevel")).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------
+  // AUDIT FIX: createLOD() adds every level's Object3D straight into the THREE scene,
+  // bypassing the MeshRenderer component Engine.ts's entity-destroy hook checks for --
+  // without LODSystem owning its own cleanup, every LOD'd entity destroy leaked every
+  // level's geometry/material/scene membership forever. See LODSystem.init()'s
+  // world.onEntityDestroy registration and disposeForEntity().
+  // -------------------------------------------------------------------------
+  it("removes LOD levels from the scene and disposes their geometry/materials when the owning entity is destroyed", () => {
+    const world = new World();
+    const scene = new THREE.Scene();
+    const eid = world.createEntity();
+    world.addComponent(eid, Transform, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
+
+    const lod = new LODSystem();
+    lod.world = world;
+    lod.init();
+
+    const geo0 = new THREE.BoxGeometry();
+    const mat0 = new THREE.MeshBasicMaterial();
+    const geo1 = new THREE.SphereGeometry();
+    const mat1 = new THREE.MeshBasicMaterial();
+    const levels: LODLevel[] = [
+      { mesh: new THREE.Mesh(geo0, mat0), distance: 10 },
+      { mesh: new THREE.Mesh(geo1, mat1), distance: 50 },
+    ];
+    lod.createLOD(eid, levels, scene);
+
+    expect(scene.children).toContain(levels[0].mesh);
+    expect(scene.children).toContain(levels[1].mesh);
+
+    const disposeSpy0 = vi.spyOn(geo0, "dispose");
+    const disposeSpy1 = vi.spyOn(geo1, "dispose");
+
+    world.destroyEntity(eid);
+
+    expect(scene.children).not.toContain(levels[0].mesh);
+    expect(scene.children).not.toContain(levels[1].mesh);
+    expect(disposeSpy0).toHaveBeenCalled();
+    expect(disposeSpy1).toHaveBeenCalled();
   });
 });
 
@@ -503,6 +639,54 @@ describe("InstancingSystem: batch grouping", () => {
     const pos = new THREE.Vector3();
     m.decompose(pos, new THREE.Quaternion(), new THREE.Vector3());
     expect(pos.x).toBeCloseTo(7, 5);
+  });
+
+  // -------------------------------------------------------------------------
+  // AUDIT FIX: destroyGroup() previously never reclaimed its slot, so lifetime group churn
+  // (not concurrent count) exhausted the fixed MAX_GROUPS=64 arrays -- see
+  // src/systems/InstancingSystem.ts's groupCount/freeGroupIds/groupActive.
+  // -------------------------------------------------------------------------
+  it("destroyGroup() reclaims its slot so lifetime churn past MAX_GROUPS doesn't exhaust the fixed-size arrays", () => {
+    const { world, inst } = makeInstSystem();
+    const geo = new THREE.BoxGeometry();
+    const mat = new THREE.MeshBasicMaterial();
+
+    // Create and immediately destroy 100 groups (well past MAX_GROUPS=64 lifetime) -- with
+    // slot reuse this should never throw, and groupCount (the high-water mark) should stay
+    // bounded since every id gets reclaimed before the next create.
+    for (let i = 0; i < 100; i++) {
+      const id = inst.createGroup(geo, mat, 4);
+      inst.destroyGroup(id);
+    }
+    expect((inst as any).groupCount).toBeLessThanOrEqual(64);
+
+    // A group created after churn is a genuinely fresh, working slot.
+    const finalId = inst.createGroup(geo, mat, 4);
+    const e = world.createEntity();
+    world.addComponent(e, Transform, { x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 });
+    expect(() => inst.addToGroup(e, finalId)).not.toThrow();
+    expect((inst as any).groupMeshes[finalId].count).toBe(1);
+  });
+
+  it("createGroup() throws once concurrently-active groups would exceed MAX_GROUPS (no silent array overrun)", () => {
+    const { inst } = makeInstSystem();
+    const geo = new THREE.BoxGeometry();
+    const mat = new THREE.MeshBasicMaterial();
+    for (let i = 0; i < 64; i++) inst.createGroup(geo, mat, 4);
+    expect(() => inst.createGroup(geo, mat, 4)).toThrow();
+  });
+
+  it("addToGroup()/removeFromGroup() on a destroyed groupId is a safe no-op, not a silent write into a freed slot", () => {
+    const { world, inst } = makeInstSystem();
+    const geo = new THREE.BoxGeometry();
+    const mat = new THREE.MeshBasicMaterial();
+    const groupId = inst.createGroup(geo, mat, 4);
+    inst.destroyGroup(groupId);
+
+    const e = world.createEntity();
+    world.addComponent(e, Transform, { x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1 });
+    expect(() => inst.addToGroup(e, groupId)).not.toThrow();
+    expect(() => inst.removeFromGroup(e, groupId)).not.toThrow();
   });
 });
 
@@ -1340,5 +1524,67 @@ describe("GPURenderSystem: per-entity matrix cache stays correct when a Transfor
 
     expect(modelXAfterFirst).toBe(0);
     expect(modelXAfterMove).toBe(5);
+  });
+});
+
+// ===========================================================================
+// WebGPUOverlaySystem: skips its full-viewport shader pass once inactive (LOW audit finding)
+// ===========================================================================
+
+describe("WebGPUOverlaySystem: early-out when the aim reticle is inactive", () => {
+  // WebGPUOverlaySystem's constructor calls document.createElement("canvas"), which needs a
+  // real DOM this Node test environment doesn't provide -- same constraint RenderSystem hits
+  // above. Call the real, unmodified update() via Function.prototype.call against a minimal
+  // object exposing exactly the fields it reads, mirroring that same pattern.
+  function makeFakeThis(active: boolean) {
+    const beginRenderPass = vi.fn(() => ({
+      setPipeline: vi.fn(), setBindGroup: vi.fn(), draw: vi.fn(), end: vi.fn(),
+    }));
+    const submit = vi.fn();
+    const writeBuffer = vi.fn();
+    const fakeThis: any = {
+      initialized: true,
+      device: {
+        queue: { writeBuffer, submit },
+        createCommandEncoder: () => ({ beginRenderPass, finish: () => ({}) }),
+      },
+      context: { getCurrentTexture: () => ({ createView: () => ({}) }) },
+      pipeline: {},
+      bindGroup: {},
+      uniformBuffer: {},
+      uniformData: new Float32Array(8),
+      time: 0,
+      canvas: { width: 100, height: 100 },
+      wasRendering: false,
+      aimProvider: () => ({ x: 0, y: 0, active }),
+    };
+    return { fakeThis, beginRenderPass, submit };
+  }
+
+  it("never renders while the reticle has always been inactive", async () => {
+    const { WebGPUOverlaySystem } = await import("../systems/WebGPUOverlaySystem");
+    const { fakeThis, beginRenderPass } = makeFakeThis(false);
+
+    (WebGPUOverlaySystem.prototype as any).update.call(fakeThis, 1 / 60);
+    (WebGPUOverlaySystem.prototype as any).update.call(fakeThis, 1 / 60);
+
+    expect(beginRenderPass).not.toHaveBeenCalled();
+  });
+
+  it("renders while active, still renders the one active->inactive transition frame (to actually clear the last visible reticle), then skips", async () => {
+    const { WebGPUOverlaySystem } = await import("../systems/WebGPUOverlaySystem");
+    const { fakeThis, beginRenderPass } = makeFakeThis(true);
+
+    (WebGPUOverlaySystem.prototype as any).update.call(fakeThis, 1 / 60);
+    expect(beginRenderPass).toHaveBeenCalledTimes(1);
+    expect(fakeThis.wasRendering).toBe(true);
+
+    fakeThis.aimProvider = () => ({ x: 0, y: 0, active: false });
+    (WebGPUOverlaySystem.prototype as any).update.call(fakeThis, 1 / 60); // transition frame: still clears
+    expect(beginRenderPass).toHaveBeenCalledTimes(2);
+    expect(fakeThis.wasRendering).toBe(false);
+
+    (WebGPUOverlaySystem.prototype as any).update.call(fakeThis, 1 / 60); // steady-state inactive: skipped
+    expect(beginRenderPass).toHaveBeenCalledTimes(2);
   });
 });

@@ -4,6 +4,7 @@ import { Clock } from "./Clock";
 import { EventBus } from "./EventBus";
 import { ResourceManager } from "./handles/ResourceManager";
 import { EngineProfiler } from "./EngineProfiler";
+import { ValidationLayer } from "./ValidationLayer";
 import { RenderSystem } from "../systems/RenderSystem";
 import type { RenderBackend } from "../systems/RenderSystem";
 import { WebGPUOverlaySystem } from "../systems/WebGPUOverlaySystem";
@@ -50,6 +51,11 @@ export interface AGEEConfig {
     fxaa?: boolean;
   };
   profiler?: boolean;
+  /** Enables ValidationLayer's dev-time checks (dead-entity access, double-release, non-finite
+   *  transforms). Off by default -- matches `profiler`'s pattern of a cheap-to-construct but
+   *  opt-in diagnostic layer, since the checks add per-call overhead callers may not want in a
+   *  shipping build. */
+  validation?: boolean;
   memoryBudget?: number;
   initTimeout?: number;
   network?: NetworkConfig;
@@ -64,6 +70,7 @@ export class AGEE {
   readonly serializer = new SceneSerializer();
   readonly spatialHash = new SpatialHash(16);
   readonly profiler: EngineProfiler;
+  readonly validation = new ValidationLayer();
 
   readonly assetSystem: AssetSystem;
   readonly gltfPipeline!: GLTFPipeline;
@@ -117,6 +124,10 @@ export class AGEE {
       trackMemory: true,
       trackRendering: true,
     });
+
+    this.validation.setEnabled(config.validation ?? false);
+    this.world.setValidation(this.validation);
+    this.resources.setValidation(this.validation);
 
     this.assetSystem = new AssetSystem();
 
@@ -183,8 +194,18 @@ export class AGEE {
     if (!this.headless) {
       parallelInits.push(this.initStep("renderer", () => this.render.ready));
       parallelInits.push(this.initStep("gpuContext", async () => {
-        this.gpuContext = await GPUContext.create();
-        (this as any).gpuRender = new GPURenderSystem();
+        // WebGPU unavailability (no navigator.gpu, no adapter, ...) must not fail the whole
+        // engine -- the Three.js overlay (RenderSystem/WebGPUOverlaySystem) can still carry
+        // full rendering duty on its own. Every downstream consumer of gpuContext/gpuRender
+        // already guards for them being unset (see the `if (this.gpuContext && this.gpuRender)`
+        // block below and the `this.gpuContext?.device ?? device` fallback in "webgpuOverlay"),
+        // so leaving both unset here is sufficient to make the native GPU path cleanly optional.
+        try {
+          this.gpuContext = await GPUContext.create();
+          (this as any).gpuRender = new GPURenderSystem();
+        } catch (e) {
+          console.warn("[AGEE] WebGPU native render path unavailable; continuing with the Three.js overlay only:", e);
+        }
       }));
     }
     await Promise.all(parallelInits);
@@ -281,10 +302,23 @@ export class AGEE {
         });
 
         this.initStep("gpuCanvas", () => {
-          // Only take over canvas layering when we own both canvases (i.e. the host didn't
-          // hand us an explicit AGEEConfig.canvas to render into directly).
+          // GPUContext.create() (see the "gpuContext" step above) always builds its OWN
+          // dedicated canvas for the WebGPU-native path, appended to document.body with
+          // display:none until now — it is never the host-supplied AGEEConfig.canvas, since a
+          // single canvas element can't host both a "webgpu" context and RenderSystem's
+          // WebGLRenderer context at once (config.canvas, when given, goes to RenderSystem
+          // instead — see the constructor above). So revealing gpuContext.canvas is always
+          // safe regardless of who supplied config.canvas; previously this was wrongly gated
+          // on `!this.config.canvas`, which meant a host using config.canvas got its Three.js
+          // overlay but the native opaque-geometry pass stayed display:none (and therefore
+          // never rendered — see GPURenderSystem.update()'s early-out) forever.
+          this.gpuContext.canvas.style.display = "block";
+
+          // Only take over the *overlay* canvas's layering when we own both canvases (i.e.
+          // the host didn't hand us an explicit AGEEConfig.canvas to render into directly) --
+          // forcing a host-supplied canvas into fixed/fullscreen positioning would fight the
+          // host's own layout.
           if (!this.config.canvas) {
-            this.gpuContext.canvas.style.display = "block";
             const overlay = this.render.renderer.domElement;
             overlay.style.position = "fixed";
             overlay.style.inset = "0";
@@ -402,7 +436,12 @@ export class AGEE {
 
     this.profiler.beginFrame();
     const dt = this.clock.tick(timestamp);
-    if (dt > 0) {
+    // Gate on rawDelta (set every real frame, pause or not), not dt (zeroed by Clock while
+    // paused) -- otherwise pausing skips this entire block, including rendering/UI systems (so
+    // a pause menu can't draw or take input) and input.endFrame() (so "just pressed" flags never
+    // clear and go stale across the pause). dt itself still reaches world.update() as 0 while
+    // paused, so simulation/physics systems still no-op their own per-frame work.
+    if (this.clock.rawDelta > 0) {
       this.events.emit("preUpdate", dt);
 
       // Update profiler stats
@@ -419,6 +458,18 @@ export class AGEE {
 
       this.world.update(dt);
       this.commands.flush(this.world);
+
+      if (this.validation.isEnabled()) {
+        const transformStore = this.world.getStore(Transform);
+        for (const eid of transformStore.entities) {
+          this.validation.checkTransformFinite(
+            eid,
+            transformStore.get(eid, "x") as number,
+            transformStore.get(eid, "y") as number,
+            transformStore.get(eid, "z") as number,
+          );
+        }
+      }
 
       if (!this.headless && this.postProcess?.isEnabled) {
         this.postProcess.render();
@@ -446,8 +497,16 @@ export class AGEE {
   destroy(): void {
     this.stop();
     this._state = "destroyed";
+    // Network systems reference the world/transport; tear them down before world.clear() so
+    // their removeSystem() calls run against a still-live world instead of racing clear()'s own
+    // system.destroy?.() pass.
+    this.network?.destroy();
     this.world.clear();
     this.resources.disposeAll();
+    // Runs after world.clear() so entity-destroy cleanup (which frees GPU-native mesh/material
+    // handles via gpuMeshPool/materialPool) still has a live GPUDevice to release those buffers
+    // against, instead of racing device.destroy() below.
+    this.gpuContext?.destroy();
     this.events.clear();
   }
 }

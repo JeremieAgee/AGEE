@@ -16,7 +16,15 @@ export class Frustum {
     for (let i = 0; i < 6; i++) this.planes.push(new Plane());
   }
 
-  setFromProjectionMatrix(m: Float32Array | number[]): this {
+  // `ndcZRange` selects which clip-space z convention `m` was built with:
+  //  - "-1..1" (OpenGL-style; THREE's PerspectiveCamera/OrthographicCamera.projectionMatrix,
+  //    which is what every current caller of this method feeds in): near plane = row4+row3.
+  //  - "0..1" (D3D/WebGPU-style; this engine's own native Mat4.perspective()/orthographic(),
+  //    see core/math/Mat4.ts): near plane = row3 alone -- adding row4 there would extract the
+  //    wrong plane and silently misclassify near-plane culling for any WebGPU-range matrix.
+  // The far plane formula (row4-row3) is identical in both conventions, so only near differs.
+  // Defaults to "-1..1" to preserve exact existing behavior for every current caller.
+  setFromProjectionMatrix(m: Float32Array | number[], ndcZRange: "-1..1" | "0..1" = "-1..1"): this {
     const me = m;
     const p = this.planes;
 
@@ -33,8 +41,13 @@ export class Frustum {
     p[3].normal.set(me[3] - me[1], me[7] - me[5], me[11] - me[9]);
     p[3].d = me[15] - me[13];
     // Near
-    p[4].normal.set(me[3] + me[2], me[7] + me[6], me[11] + me[10]);
-    p[4].d = me[15] + me[14];
+    if (ndcZRange === "0..1") {
+      p[4].normal.set(me[2], me[6], me[10]);
+      p[4].d = me[14];
+    } else {
+      p[4].normal.set(me[3] + me[2], me[7] + me[6], me[11] + me[10]);
+      p[4].d = me[15] + me[14];
+    }
     // Far
     p[5].normal.set(me[3] - me[2], me[7] - me[6], me[11] - me[10]);
     p[5].d = me[15] - me[14];

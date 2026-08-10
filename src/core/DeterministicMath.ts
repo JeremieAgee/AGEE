@@ -1,3 +1,5 @@
+import { SIN_TABLE_4096 } from "./SinTable";
+
 export const PI = 3.14159265358979323846;
 export const TWO_PI = 6.28318530717958647692;
 export const HALF_PI = 1.57079632679489661923;
@@ -7,10 +9,10 @@ const SIN_TABLE_SIZE = 4096;
 const SIN_TABLE_MASK = SIN_TABLE_SIZE - 1;
 const SIN_SCALE = SIN_TABLE_SIZE / TWO_PI;
 
-const sinTable = new Float64Array(SIN_TABLE_SIZE);
-for (let i = 0; i < SIN_TABLE_SIZE; i++) {
-  sinTable[i] = Math.sin((i / SIN_TABLE_SIZE) * TWO_PI);
-}
+// SIN_TABLE_4096 is a checked-in literal (see SinTable.ts), not computed from Math.sin at
+// module load — the JS spec guarantees numeric literals parse to the same IEEE-754 bits on
+// every engine, which a runtime Math.sin call does not.
+const sinTable = Float64Array.from(SIN_TABLE_4096);
 
 function normalizeAngle(a: number): number {
   a = a % TWO_PI;

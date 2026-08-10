@@ -14,6 +14,14 @@ export const NavAgent = defineComponent("NavAgent", {
   pathHandle: "i32",
   pathIndex: "i32",
   pathLength: "i32",
+  // Sim time (see NavigationSystem.simTime) at which setTarget() last actually ran a full
+  // findPath() for this agent -- part of the setTarget() replan throttle, see setTarget().
+  lastReplanTime: "f32",
+  // Whether the agent's current path was cut off at MAX_PATH_NODES (the route to targetX/Y/Z
+  // is longer than a path slot can hold) rather than genuinely reaching the target -- lets
+  // stepOnce() tell "ran out of a truncated path's near segment" apart from "arrived", see
+  // stepOnce().
+  pathTruncated: "bool",
 });
 
 // Path storage: flat Float32Array pools instead of Vec3[] per entity
@@ -51,6 +59,9 @@ export class NavigationSystem extends System {
   // SOA path storage: flat buffer holding all paths, indexed by pathHandle
   private pathData: Float32Array;
   private pathLengths: Int32Array;
+  // Per-slot: whether that path's route was cut off at MAX_PATH_NODES rather than reaching the
+  // real goal cell (see the truncation branch in findPath()). Parallel array to pathLengths.
+  private pathTruncatedSlots: Uint8Array;
   private pathFreeList: number[] = [];
   private nextPathSlot = 0;
   private maxPaths: number;
@@ -64,11 +75,22 @@ export class NavigationSystem extends System {
   private static readonly MAX_SUBSTEPS = 8;
   private accumulator = 0;
 
+  // Deterministic sim clock (advances by FIXED_STEP per stepOnce(), not wall-clock time) used
+  // only to throttle setTarget()'s replan rate -- see setTarget().
+  private simTime = 0;
+
+  // Minimum sim-time gap between setTarget()-triggered full A* replans for the same agent, and
+  // the "did the target actually move" distance-delta guard below it, mirroring GOAP's
+  // deliberate replanInterval/budget throttle (see GOAP.ts) instead of letting a chase AI
+  // calling setTarget() every tick trigger a full grid-wide A* every frame per agent.
+  private static readonly MIN_REPLAN_INTERVAL = 0.2;
+
   constructor(maxPaths: number = 256) {
     super();
     this.maxPaths = maxPaths;
     this.pathData = new Float32Array(maxPaths * PATH_STRIDE);
     this.pathLengths = new Int32Array(maxPaths);
+    this.pathTruncatedSlots = new Uint8Array(maxPaths);
   }
 
   init(): void {
@@ -115,6 +137,7 @@ export class NavigationSystem extends System {
 
   private freePath(slot: number): void {
     this.pathLengths[slot] = 0;
+    this.pathTruncatedSlots[slot] = 0;
     this.pathFreeList.push(slot);
   }
 
@@ -124,8 +147,11 @@ export class NavigationSystem extends System {
     newData.set(this.pathData);
     const newLengths = new Int32Array(newMax);
     newLengths.set(this.pathLengths);
+    const newTruncated = new Uint8Array(newMax);
+    newTruncated.set(this.pathTruncatedSlots);
     this.pathData = newData;
     this.pathLengths = newLengths;
+    this.pathTruncatedSlots = newTruncated;
     this.maxPaths = newMax;
   }
 
@@ -224,10 +250,34 @@ export class NavigationSystem extends System {
       this.pathData[offset + i * 3 + 2] = pz;
     }
     this.pathLengths[slot] = pathLen;
+    // Route was cut off before reaching the real goal cell -- see stepOnce()'s truncated-path
+    // continuation, which uses this to tell "ran out of a truncated segment" apart from a
+    // genuine arrival.
+    this.pathTruncatedSlots[slot] = fullLen > pathLen ? 1 : 0;
     return slot;
   }
 
-  setTarget(eid: number, x: number, y: number, z: number): void {
+  /** Assigns eid a new path toward (x,y,z), throttled to avoid a full grid-wide A* search on
+   *  every call. Mirrors GOAP's deliberate replanInterval/budget throttle (see GOAP.ts): calls
+   *  within MIN_REPLAN_INTERVAL of the last real replan are coalesced away if the target hasn't
+   *  moved more than half a grid cell, so a chase AI calling setTarget() every tick doesn't
+   *  trigger a full re-path every frame per agent. Pass `force: true` to always replan
+   *  immediately (e.g. the target became unreachable, or the caller otherwise knows an
+   *  immediate replan is required) -- stepOnce()'s own truncated-path continuation calls
+   *  findPath() directly rather than through here for exactly that reason. */
+  setTarget(eid: number, x: number, y: number, z: number, force: boolean = false): void {
+    if (!force && this.navStore.has(eid) && this.navStore.get(eid, "hasTarget") === 1) {
+      const sinceReplan = this.simTime - (this.navStore.get(eid, "lastReplanTime") as number);
+      if (sinceReplan < NavigationSystem.MIN_REPLAN_INTERVAL) {
+        const prevTargetX = this.navStore.get(eid, "targetX") as number;
+        const prevTargetZ = this.navStore.get(eid, "targetZ") as number;
+        const ddx = x - prevTargetX;
+        const ddz = z - prevTargetZ;
+        const epsilon = this.grid ? this.grid.cellSize * 0.5 : 0.5;
+        if (ddx * ddx + ddz * ddz < epsilon * epsilon) return;
+      }
+    }
+
     const tx = this.transformStore.get(eid, "x");
     const tz = this.transformStore.get(eid, "z");
 
@@ -243,6 +293,8 @@ export class NavigationSystem extends System {
     this.navStore.set(eid, "pathHandle", pathHandle);
     this.navStore.set(eid, "pathIndex", 0);
     this.navStore.set(eid, "pathLength", pathHandle >= 0 ? this.pathLengths[pathHandle] : 0);
+    this.navStore.set(eid, "pathTruncated", pathHandle >= 0 ? this.pathTruncatedSlots[pathHandle] : 0);
+    this.navStore.set(eid, "lastReplanTime", this.simTime);
   }
 
   // Hot loop — pure SOA column reads for movement
@@ -260,12 +312,19 @@ export class NavigationSystem extends System {
   }
 
   private stepOnce(entities: number[], dt: number): void {
+    // Deterministic sim clock, advanced only here (fixed-step) — used solely to gate
+    // setTarget()'s replan throttle, see setTarget().
+    this.simTime += dt;
+
     const hasTargets = this.navStore.getColumn("hasTarget");
     const speeds = this.navStore.getColumn("speed");
     const stopDists = this.navStore.getColumn("stoppingDistance");
     const pathHandles = this.navStore.getColumn("pathHandle");
     const pathIndices = this.navStore.getColumn("pathIndex");
     const pathLengths = this.navStore.getColumn("pathLength");
+    const pathTruncated = this.navStore.getColumn("pathTruncated");
+    const targetXs = this.navStore.getColumn("targetX");
+    const targetZs = this.navStore.getColumn("targetZ");
 
     const px = this.transformStore.getColumn("x");
     const pz = this.transformStore.getColumn("z");
@@ -295,12 +354,32 @@ export class NavigationSystem extends System {
 
       if (dist < stopDist) {
         idx++;
-        pathIndices[eid] = idx;
         if (idx >= len) {
+          // Ran out of waypoints. If this path was truncated at MAX_PATH_NODES (didn't
+          // actually reach targetX/Y/Z), this is "ran out of the near segment", not a genuine
+          // arrival -- immediately continue toward the original target with a fresh
+          // findPath() from the agent's current position instead of silently stopping like a
+          // real arrival would. Calls findPath() directly (bypassing setTarget()'s replan
+          // throttle) since this is a forced, system-driven continuation of the same journey,
+          // not a new externally-requested target.
+          if (pathTruncated[eid] === 1) {
+            const newHandle = this.findPath(px[eid], pz[eid], targetXs[eid], targetZs[eid]);
+            this.freePath(handle);
+            if (newHandle >= 0) {
+              pathHandles[eid] = newHandle;
+              pathIndices[eid] = 0;
+              pathLengths[eid] = this.pathLengths[newHandle];
+              pathTruncated[eid] = this.pathTruncatedSlots[newHandle];
+              this.navStore.set(eid, "lastReplanTime", this.simTime);
+              continue;
+            }
+            // No continuation found (e.g. the target became unreachable) -- fall through and
+            // stop, same as a genuine arrival/dead-end.
+          }
           hasTargets[eid] = 0;
-          if (handle >= 0) this.freePath(handle);
           pathHandles[eid] = -1;
         }
+        pathIndices[eid] = idx;
         continue;
       }
 

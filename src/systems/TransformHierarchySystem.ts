@@ -153,7 +153,16 @@ export class TransformHierarchySystem extends System {
   // This does mean a node's subtree can get rescanned once per ancestor on the way down;
   // that's accepted here as simpler and still bounded by MAX_HIERARCHY_DEPTH rather than
   // restructuring the traversal to cache a bottom-up subtree-dirty flag.
-  private hasDirtyDescendants(eid: number): boolean {
+  // `visited` mirrors updateEntity()'s `visiting` cycle guard: this runs BEFORE that
+  // protection applies (it's called from within updateEntity() before any cycle can be
+  // caught there), so without its own guard a cyclic Parent/Children graph recurses here
+  // unbounded and overflows the stack. Threaded through the recursion (not the shared
+  // `this.visiting` field) since this is a read-only lookahead with no enter/exit pairing --
+  // a fresh Set per top-level call still stops any cycle after at most one full loop.
+  private hasDirtyDescendants(eid: number, visited: Set<number> = new Set()): boolean {
+    if (visited.has(eid)) return false;
+    visited.add(eid);
+
     if (!this.childrenStore.has(eid)) return false;
     const childIds = this.childrenStore.get(eid, "entities") as number[] | null;
     if (!childIds) return false;
@@ -163,7 +172,7 @@ export class TransformHierarchySystem extends System {
       if (this.worldStore.has(childEid) && this.worldStore.get(childEid, "dirty") !== 0) {
         return true;
       }
-      if (this.hasDirtyDescendants(childEid)) return true;
+      if (this.hasDirtyDescendants(childEid, visited)) return true;
     }
     return false;
   }

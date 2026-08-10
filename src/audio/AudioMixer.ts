@@ -13,6 +13,12 @@ export class AudioMixer {
   private masterGain: GainNode;
   private buses = new Map<string, AudioBus>();
   private masterVolume = 1;
+  // AUDIT fix: playMusic() used to never stop the previous track, and since loop:true keeps
+  // an AudioBufferSourceNode "actively processing" it's never GC-eligible — every zone
+  // transition permanently layered another infinite loop onto the music bus. Tracking the
+  // current music source (+ its gain node) lets us stop/disconnect it before starting a new
+  // one.
+  private currentMusic: { source: AudioBufferSourceNode; gain: GainNode } | null = null;
 
   constructor(listener: THREE.AudioListener) {
     this.listener = listener;
@@ -94,6 +100,8 @@ export class AudioMixer {
     loop: boolean = true,
     fadeIn: number = 1
   ): AudioBufferSourceNode {
+    this.stopMusic();
+
     const source = this.ctx.createBufferSource();
     source.buffer = buffer;
     source.loop = loop;
@@ -105,7 +113,24 @@ export class AudioMixer {
 
     this.connectToBus(gainNode, "music");
     source.start();
+    this.currentMusic = { source, gain: gainNode };
     return source;
+  }
+
+  /** Stops and disconnects the currently-playing music track, if any. Called automatically
+   *  by playMusic() before starting a new track; also exposed for callers that just want
+   *  silence (e.g. leaving a music-bearing zone). */
+  stopMusic(): void {
+    if (!this.currentMusic) return;
+    const { source, gain } = this.currentMusic;
+    try {
+      source.stop();
+    } catch {
+      // Already stopped/ended — safe to ignore.
+    }
+    source.disconnect();
+    gain.disconnect();
+    this.currentMusic = null;
   }
 
   get context(): AudioContext {

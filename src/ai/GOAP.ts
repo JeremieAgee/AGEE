@@ -113,15 +113,29 @@ export class GOAPPlanner {
   // pile of simultaneous replans spreads its cost across several frames instead of spiking one.
   private iterationBudgetPerFrame = 2000;
   private remainingBudget = this.iterationBudgetPerFrame;
-  // Safety net for callers that drive tick() directly instead of through AISystem (which
-  // calls beginFrame() once per real frame): without it, remainingBudget only ever counts
-  // down and a planner used standalone permanently stops producing new plans once the
-  // one-time budget is exhausted, since nothing else would ever replenish it. Refilling on
-  // a real-time window (rather than only via explicit beginFrame() calls) makes the budget
-  // self-sustaining for standalone use while staying a no-op for AISystem-driven use, since
-  // beginFrame() there already resets it well within this window every frame.
+  // Safety net for callers that drive tick() directly instead of through AISystem (which calls
+  // beginFrame() once per real frame): without it, remainingBudget only ever counts down and a
+  // planner used standalone permanently stops producing new plans once the one-time budget is
+  // exhausted, since nothing else would ever replenish it. Refilling on a real-time window
+  // (rather than only via explicit beginFrame() calls) makes the budget self-sustaining for
+  // standalone use.
+  //
+  // This must NOT apply when AISystem owns the planner: AISystem.update() already calls
+  // beginFrame() once per real frame as the sole source of truth for the budget, and its
+  // entity loop can legitimately take longer than AUTO_REFILL_WINDOW_MS when many agents
+  // replan on the same frame -- exactly the scenario the shared budget cap exists to protect.
+  // If ensureBudget() auto-refilled in that case too, a later agent's tick() mid-loop would
+  // silently top the budget back up and blow past the per-frame cap at the worst possible
+  // moment. `standalone` (constructor-set, defaulting to true so existing direct-tick()-driven
+  // callers/tests keep working unchanged) gates that auto-refill; AISystem constructs its
+  // planner with `standalone: false` and relies solely on its own beginFrame() call.
   private static readonly AUTO_REFILL_WINDOW_MS = 1000 / 30;
   private lastRefillAt = GOAPPlanner.now();
+  private readonly standalone: boolean;
+
+  constructor(standalone: boolean = true) {
+    this.standalone = standalone;
+  }
 
   private static now(): number {
     return typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -133,6 +147,7 @@ export class GOAPPlanner {
   }
 
   private ensureBudget(): void {
+    if (!this.standalone) return;
     const t = GOAPPlanner.now();
     if (t - this.lastRefillAt >= GOAPPlanner.AUTO_REFILL_WINDOW_MS) {
       this.remainingBudget = this.iterationBudgetPerFrame;
@@ -266,7 +281,7 @@ export class GOAPPlanner {
     // pop via bestCostForState) so the plain shared MinHeap — push/pop keyed by cost, no
     // decrease-key/contains — is all this needs.
     const open = new MinHeap<PlanNode>();
-    open.push(start, start.cost);
+    open.push(start, start.cost + this.heuristic(start.state, goalState));
     // Fixed, pre-sorted list of every key that can ever appear in a state reached from
     // `start` (a successor state only ever gains keys via action.effects, never loses any —
     // see the plain `new Map(current.state)` + `.set()` below). Computed once per search so
@@ -336,11 +351,27 @@ export class GOAPPlanner {
           parent: current,
           depth: current.depth + 1,
         };
-        open.push(newNode, newNode.cost);
+        open.push(newNode, newNode.cost + this.heuristic(newState, goalState));
       }
     }
 
     return open.length === 0 || search.iterations >= this.maxIterations ? "done" : "pending";
+  }
+
+  // Standard GOAP/STRIPS "goal-count" heuristic: the number of goal conditions `state` does not
+  // yet satisfy. Turns the frontier priority (see beginSearch/stepSearch) into proper A*
+  // (f = g + h) instead of uninformed Dijkstra-by-raw-cost, which otherwise lets the search
+  // burn its capped iteration/frame budget expanding many cheap-but-irrelevant states before
+  // ever reaching a goal state -- incorrectly reporting "no plan" via the iteration cap even
+  // when one exists. Cheap (one pass over goal's conditions) and, while not strictly admissible
+  // for every possible action-cost domain, is the well-established default heuristic for this
+  // style of planner.
+  private heuristic(state: WorldState, goal: WorldState): number {
+    let unsatisfied = 0;
+    for (const [key, val] of goal) {
+      if (state.get(key) !== val) unsatisfied++;
+    }
+    return unsatisfied;
   }
 
   private extractPlan(search: SearchState): GOAPAction[] {

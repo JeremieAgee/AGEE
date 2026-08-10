@@ -6,6 +6,13 @@ export const enum DirtyFlags {
   WORLD = 1 << 1,
   POSE  = 1 << 2,
   MOTOR = 1 << 3,
+  // Set on a bone when some bone in its subtree (not itself) has a pending LOCAL change,
+  // maintained incrementally by markLocalDirty()'s upward propagation rather than recomputed
+  // by re-walking descendants on every check -- see markLocalDirty()/propagateDescendantDirty()
+  // below and SkeletonSystem.evaluateBoneFK()'s use of it in place of a recursive descendant
+  // scan (the same "propagate on write, read cached flag on check" shape as ArchetypeIndex's
+  // version-counter pattern elsewhere in the engine).
+  DESCENDANT_DIRTY = 1 << 4,
 }
 
 export const enum MotorMode {
@@ -60,9 +67,16 @@ export class SkeletonInstance {
 
   active: boolean;
 
-  constructor(definitionHandle: Handle, boneCount: number) {
+  // Optional parent-index chain (SkeletonDefinition.parents), used only to propagate
+  // DESCENDANT_DIRTY up the ancestor chain from markLocalDirty(). Instances created directly
+  // in isolation (without a definition's parent chain, e.g. in unit tests exercising just the
+  // dirty-flag bookkeeping) simply skip propagation.
+  private readonly parents: Int32Array | null;
+
+  constructor(definitionHandle: Handle, boneCount: number, parents?: Int32Array) {
     this.definitionHandle = definitionHandle;
     this.boneCount = boneCount;
+    this.parents = parents ?? null;
 
     this.localPosX = new Float32Array(boneCount);
     this.localPosY = new Float32Array(boneCount);
@@ -118,6 +132,23 @@ export class SkeletonInstance {
 
   markLocalDirty(boneIndex: number): void {
     this.dirtyFlags[boneIndex] |= DirtyFlags.LOCAL;
+    this.propagateDescendantDirty(boneIndex);
+  }
+
+  // Walks boneIndex's ancestor chain marking DESCENDANT_DIRTY, stopping as soon as it reaches
+  // an ancestor that already has the bit set -- by the same invariant this method maintains,
+  // that ancestor's own ancestors must already be marked too, so there's nothing further to do.
+  // This is the "propagate on write" half of the incremental scheme: it replaces
+  // SkeletonSystem's old hasDirtyLocalDescendant(), which re-walked every descendant of every
+  // clean bone on every single frame just to answer the same question this now answers in O(1).
+  private propagateDescendantDirty(boneIndex: number): void {
+    if (!this.parents) return;
+    let idx = this.parents[boneIndex];
+    while (idx !== -1) {
+      if (this.dirtyFlags[idx] & DirtyFlags.DESCENDANT_DIRTY) return;
+      this.dirtyFlags[idx] |= DirtyFlags.DESCENDANT_DIRTY;
+      idx = this.parents[idx];
+    }
   }
 
   markMotorDirty(boneIndex: number): void {

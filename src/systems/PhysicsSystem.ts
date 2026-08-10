@@ -946,6 +946,11 @@ export class PhysicsSystem extends System {
 
   destroy(): void {
     if (this.initialized) {
+      // AUDIT fix: EventQueue is a separately-allocated Rapier WASM resource — freeing
+      // rapierWorld does not free it, so without this it leaks WASM memory on every
+      // PhysicsSystem teardown. It has no dependency on rapierWorld's lifetime, so either
+      // free order is safe.
+      this.eventQueue.free();
       this.rapierWorld.free();
     }
   }

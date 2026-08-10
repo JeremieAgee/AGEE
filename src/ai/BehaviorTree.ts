@@ -32,6 +32,18 @@ export class Blackboard {
   clear(): void {
     this.data.clear();
   }
+
+  get size(): number {
+    return this.data.size;
+  }
+
+  /** Read-only view of every key/value currently on the blackboard, for debugging/inspection
+   *  tools (e.g. AIDebugPanel) that need to enumerate arbitrary runtime-set entries without
+   *  reaching into the private `data` map directly via `as any`. Iterating the returned
+   *  iterable does not mutate the blackboard. */
+  entries(): IterableIterator<[string, any]> {
+    return this.data.entries();
+  }
 }
 
 export type ActionFn = (eid: number, bb: Blackboard, dt: number) => BTStatus;

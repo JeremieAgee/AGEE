@@ -60,6 +60,13 @@ export class TerrainWorkerClient {
   destroy(): void {
     this.worker?.terminate();
     this.worker = null;
+    // AUDIT FIX: previously cleared `pending` without settling any of it, so a direct
+    // `await build()` spanning a destroy() call hung forever (latent since callers only used
+    // `.then()`, which never surfaced the leak). Reject every outstanding entry first so any
+    // pending promise settles instead of hanging.
+    for (const { reject } of this.pending.values()) {
+      reject(new Error("[AGEE] TerrainWorkerClient: destroyed while request was pending"));
+    }
     this.pending.clear();
   }
 }

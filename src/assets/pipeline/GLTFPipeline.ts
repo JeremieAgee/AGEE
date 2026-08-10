@@ -5,7 +5,7 @@ import { World } from "../../ecs";
 import { Transform, MeshRenderer, GPUMeshRenderer } from "../../core/Components";
 import { LocalTransform, WorldTransform, Parent, Children } from "../../core/HierarchyComponents";
 import type { GPUContext } from "../../gpu/GPUContext";
-import type { HandleMap } from "../../core/handles/Handle";
+import type { Handle, HandleMap } from "../../core/handles/Handle";
 import { GPUMesh } from "../../gpu/GPUMesh";
 import type { GPUMaterialPool } from "../../gpu/GPUMaterialPool";
 import { extractGeometry } from "../../gpu/ThreeGeometryAdapter";
@@ -66,6 +66,29 @@ export class GLTFPipeline {
   // callers through this cache instead makes a shared GLTF asset retain-counted like every
   // other asset type: N callers means N retains on the one real load, not N independent loads.
   private inflight = new Map<AssetId, Promise<GLTFAsset>>();
+
+  // AUDIT FIX: createEntityFromObject() used to call GPUMesh.create()/meshPool.alloc() fresh
+  // for every instance instantiate() produced, so N instances of one asset uploaded N
+  // independent GPU vertex/index buffers instead of sharing one. instantiate() clones share
+  // the source geometry by reference (see instantiate()'s cloneSkeleton comment — every clone's
+  // Mesh.geometry is literally the same THREE.BufferGeometry object as the original asset's),
+  // so caching the resulting GPUMesh handle by that geometry identity and meshPool.retain()-ing
+  // it on a cache hit gives the standard shared-resource-instancing pattern for free, using the
+  // engine's existing ref-counted HandleMap (meshPool) rather than new infrastructure. Engine.ts's
+  // per-entity destroy path already free()s/getRefCount()-gates destroy() on meshPool handles
+  // correctly (see its GPUMeshRenderer cleanup), so a shared handle is released safely as
+  // instances are destroyed.
+  //
+  // Materials are deliberately NOT cached/shared the same way: GPUMaterialPool.free() (src/gpu/,
+  // out of scope for this pass) unconditionally destroys the material's buffer and owned
+  // textures on every free() call regardless of how many handles/entities still reference it —
+  // unlike meshPool, it isn't refcount-gated and exposes no retain(). Sharing a materialHandle
+  // across entities under that behavior would mean destroying any one sharing entity frees GPU
+  // resources every other entity referencing the same handle is still drawing from — a
+  // use-after-free, not a fix. Fixing that would require ref-counted destroy in
+  // GPUMaterialPool.free() (and Engine.ts's cleanup to gate on it, mirroring the mesh path),
+  // which is out of scope here.
+  private gpuMeshCache = new Map<THREE.BufferGeometry, Handle>();
 
   constructor(assets: AssetSystem) {
     this.assets = assets;
@@ -313,9 +336,29 @@ export class GLTFPipeline {
       // meshes means they keep animating correctly instead of rendering frozen.
       if (this.gpuTarget && !(obj instanceof THREE.SkinnedMesh)) {
         try {
-          const desc = extractGeometry(obj.geometry);
-          const gpuMesh = GPUMesh.create(this.gpuTarget.ctx, desc);
-          const meshHandle = this.gpuTarget.meshPool.alloc(gpuMesh);
+          // Reuse an already-uploaded GPUMesh for this exact (shared) geometry when one
+          // exists and is still live — see gpuMeshCache above. retain() returns false for a
+          // stale cache entry (e.g. every previous instance sharing it was already destroyed
+          // and the handle freed), in which case we fall through and re-upload/re-cache.
+          const cachedMeshHandle = this.gpuMeshCache.get(obj.geometry);
+          let meshHandle: Handle;
+          if (cachedMeshHandle !== undefined && this.gpuTarget.meshPool.retain(cachedMeshHandle)) {
+            meshHandle = cachedMeshHandle;
+          } else {
+            const desc = extractGeometry(obj.geometry);
+            const gpuMesh = GPUMesh.create(this.gpuTarget.ctx, desc);
+            meshHandle = this.gpuTarget.meshPool.alloc(gpuMesh);
+            this.gpuMeshCache.set(obj.geometry, meshHandle);
+
+            // Only counted here, on the cache miss that actually allocates the GPU buffers —
+            // not once per instance — so MemoryBudget reflects the real (shared) GPU
+            // allocation instead of over-counting by a factor of instance count. This is the
+            // GPU-native buffer size (vertexBuffer/indexBuffer.size), separate from the
+            // CPU-side geometry byte estimate already tracked once at load time in
+            // loadAndRegister().
+            const gpuBytes = gpuMesh.vertexBuffer.size + (gpuMesh.indexBuffer?.size ?? 0);
+            this.assets.memoryBudget.trackAllocation(ResourceType.Mesh, gpuBytes);
+          }
 
           const srcMat = Array.isArray(obj.material) ? obj.material[0] : obj.material;
           const standard = srcMat as THREE.MeshStandardMaterial | undefined;

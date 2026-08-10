@@ -287,6 +287,19 @@ export class GPURenderSystem extends System {
     });
 
     this.initShadowMap(device);
+
+    // Per-entity model/normal matrix cache (see matrixCacheCapacity et al. above) is indexed
+    // by eid in fixed-growth typed arrays that never shrink -- invalidate a destroyed entity's
+    // slot so a stale cached-valid flag can't be misread if this system is ever queried before
+    // that eid is reused. Same world.onEntityDestroy registry Engine.ts/LODSystem/
+    // CullingSystem/NetworkReceiveSystem use for their own per-system cleanup (see World.ts).
+    if (this.world) this.world.onEntityDestroy((eid) => this.onEntityDestroyed(eid));
+  }
+
+  /** Invalidates this entity's cached model/normal matrix slot, if any. Called automatically
+   * on entity destroy (registered in init() above); safe to call directly too. */
+  onEntityDestroyed(eid: number): void {
+    if (eid < this.cachedValid.length) this.cachedValid[eid] = 0;
   }
 
   // depth32float (not depth24plus) because it's the one depth format guaranteed sampleable as a
@@ -458,6 +471,9 @@ export class GPURenderSystem extends System {
 
   update(_dt: number): void {
     if (!this.gpuCtx || !this.meshPool || !this._materialPool) return;
+    // Device was lost (see GPUContext.lost) -- cleanly stop presenting instead of calling into
+    // a dead device. No re-init is attempted here (see GPUContext.ts's `lost` getter comment).
+    if (this.gpuCtx.lost) return;
     if (this.gpuCtx.canvas.style.display === "none") return;
 
     if (this._cameraSystem) {

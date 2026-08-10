@@ -31,7 +31,14 @@ interface ConnectedClient {
   // the shared ring buffer by tick). Diffing against this — rather than a globally shared
   // unfiltered snapshot — is what lets a newly-relevant entity be recognized as a spawn
   // even if none of its fields changed since the client's last acked tick.
+  //
+  // AUDIT FIX: this used to be replaced with whatever was just sent on every tick regardless
+  // of whether the client actually received it. Now it's only advanced once lastAckedTick
+  // (see ackClient()) confirms the client has the tick it names — see sendServerSnapshots().
   lastSentSnapshot: Snapshot | null;
+  // Ticks elapsed since lastSentSnapshot was set without lastAckedTick catching up to it yet.
+  // Reset whenever the baseline advances; see ACK_TIMEOUT_TICKS.
+  unackedTicks: number;
 }
 
 export class NetworkSendSystem extends System {
@@ -69,6 +76,16 @@ export class NetworkSendSystem extends System {
   // grows without bound. 64 KiB is a few snapshots' worth of backlog — enough slack to absorb a
   // brief stall without skipping sends, small enough to catch sustained congestion quickly.
   private static readonly CONGESTION_THRESHOLD_BYTES = 64 * 1024;
+
+  // AUDIT FIX: if a client silently drops (no immediate transport-level signal) and its
+  // baseline never gets ack'd, sendServerSnapshots() now holds that baseline steady instead of
+  // advancing past a tick the client may never have received (see below) — but holding forever
+  // would freeze a genuinely-gone client's diff base indefinitely short of a full
+  // removeClient/addClient cycle. After this many consecutive ticks without the baseline being
+  // ack'd, give up waiting and force a fresh full snapshot to resync. 60 ticks is ~3s at the
+  // default 20Hz server tick rate — long enough to absorb ordinary latency/jitter, short enough
+  // to recover a stuck client promptly.
+  private static readonly ACK_TIMEOUT_TICKS = 60;
 
   // Network ID to entity mapping (shared reference from receive system)
   private networkIdToEntity: ReadonlyMap<number, number> = new Map();
@@ -195,27 +212,62 @@ export class NetworkSendSystem extends System {
       // unfiltered snapshot looked up by tick — otherwise an entity that only just entered
       // this client's interest radius, without any of its fields changing since that tick,
       // looks "unchanged" in the diff and is silently never sent as a spawn.
-      if (client.lastSentSnapshot) {
-        const delta = this.snapshotManager.createDelta(snapshot, client.lastSentSnapshot);
+      const baseline = client.lastSentSnapshot;
+      if (baseline) {
+        const delta = this.snapshotManager.createDelta(snapshot, baseline);
         writeDeltaSnapshot(this.writer, delta, this.registry);
       } else {
         writeSnapshot(this.writer, snapshot, this.registry);
       }
 
       client.transport.send(this.writer.toArrayBuffer());
-      client.lastSentSnapshot = snapshot;
+
+      // AUDIT FIX: this used to unconditionally set client.lastSentSnapshot = snapshot here,
+      // regardless of whether the client actually received what was just sent. If a delta (or
+      // even a full snapshot) silently never arrived, every subsequent delta kept being
+      // computed against a baseline the client didn't have — client-side dropped them (see
+      // NetworkReceiveSystem's "Missing baseline" handling) and stayed frozen indefinitely,
+      // short of a full removeClient/addClient cycle. Only advance the baseline once the
+      // previous one has actually been ack'd (ackClient()/lastAckedTick) — until then, keep
+      // re-diffing against the same known-good baseline so a late ack still catches the
+      // client up correctly.
+      if (!baseline || client.lastAckedTick >= baseline.tick) {
+        client.lastSentSnapshot = snapshot;
+        client.unackedTicks = 0;
+      } else {
+        client.unackedTicks++;
+        if (client.unackedTicks > NetworkSendSystem.ACK_TIMEOUT_TICKS) {
+          // The client hasn't ack'd this baseline for far too long — stop waiting and force a
+          // fresh full snapshot next tick to resync instead of leaving it frozen forever.
+          client.lastSentSnapshot = null;
+          client.unackedTicks = 0;
+        }
+      }
     }
   }
 
   // Server API
 
-  addClient(clientId: number, clientTransport: Transport): void {
+  get clientCount(): number {
+    return this.connectedClients.size;
+  }
+
+  /** Registers a server-side client connection. Returns false (without registering anything)
+   *  if the server is already at NETWORK_CONSTANTS.MAX_CLIENTS and this isn't a reconnect of an
+   *  already-registered clientId — a new slot is never handed out past that cap. */
+  addClient(clientId: number, clientTransport: Transport): boolean {
+    if (!this.connectedClients.has(clientId) && this.connectedClients.size >= NETWORK_CONSTANTS.MAX_CLIENTS) {
+      console.warn(`[Network] Rejecting client ${clientId}: server is at MAX_CLIENTS (${NETWORK_CONSTANTS.MAX_CLIENTS})`);
+      return false;
+    }
     this.connectedClients.set(clientId, {
       transport: clientTransport,
       lastAckedTick: 0,
       position: { x: 0, y: 0, z: 0 },
       lastSentSnapshot: null,
+      unackedTicks: 0,
     });
+    return true;
   }
 
   removeClient(clientId: number): void {

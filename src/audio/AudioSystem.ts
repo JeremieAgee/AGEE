@@ -115,6 +115,16 @@ export class AudioSystem extends System {
       const y = this.transformStore.get(eid, "y");
       const z = this.transformStore.get(eid, "z");
       sound.position.set(x, y, z);
+
+      // AUDIT fix: PositionalAudio is never parented into the Three.js scene graph (it has
+      // no mesh to attach to and AudioSystem has no scene reference), so nothing ever
+      // traverses it to recompute matrixWorld — the WebAudio panner reads matrixWorld, not
+      // .position, so without this the sound would play at correct volume/loop but with
+      // zero panning/attenuation (always sounds centered on the listener). Since the node
+      // has no parent, updateMatrixWorld() derives world transform directly from the local
+      // position we just set, which is exactly what PositionalAudio.updateMatrixWorld()
+      // pushes into the panner.
+      sound.updateMatrixWorld();
     }
   }
 

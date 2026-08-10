@@ -31,6 +31,7 @@ describe("EditorOverlay", () => {
   function makeFakeEngine() {
     const world = new World();
     let preUpdateCb: ((dt: number) => void) | null = null;
+    const unsubscribePreUpdate = vi.fn();
     const engine = {
       world,
       profiler: { setEnabled: vi.fn() },
@@ -38,11 +39,11 @@ describe("EditorOverlay", () => {
       events: {
         on: vi.fn((event: string, cb: (dt: number) => void) => {
           if (event === "preUpdate") preUpdateCb = cb;
-          return () => {};
+          return unsubscribePreUpdate;
         }),
       },
     } as any;
-    return { engine, world, tick: (dt: number) => preUpdateCb?.(dt) };
+    return { engine, world, tick: (dt: number) => preUpdateCb?.(dt), unsubscribePreUpdate };
   }
 
   it("init() builds the inspector panel and lists live entities once ticked", () => {
@@ -73,6 +74,29 @@ describe("EditorOverlay", () => {
 
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "i" }));
     expect(root.style.display).toBe("none");
+  });
+
+  // AUDIT: unlike DevConsole/DebugOverlay/PhysicsDebugRenderer, EditorOverlay used to have no
+  // destroy() at all — its window keydown listener and engine.events "preUpdate" subscription
+  // just leaked for the lifetime of the page.
+  it("destroy() removes the panel and unsubscribes from preUpdate", () => {
+    const { engine, unsubscribePreUpdate } = makeFakeEngine();
+    const overlay = EditorOverlay.init(engine);
+    expect(unsubscribePreUpdate).not.toHaveBeenCalled();
+
+    overlay.destroy();
+
+    expect(document.getElementById("agee-editor-inspector")).toBeNull();
+    expect(unsubscribePreUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("destroy() stops the 'i' key from toggling a (removed) panel", () => {
+    const { engine } = makeFakeEngine();
+    const overlay = EditorOverlay.init(engine);
+    overlay.destroy();
+
+    // Should not throw even though the panel element is gone.
+    expect(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "i" }))).not.toThrow();
   });
 });
 

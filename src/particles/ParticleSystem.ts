@@ -41,13 +41,18 @@ interface EmitterData {
   colorAttr: THREE.BufferAttribute;
 }
 
-function unpackColor(c: number): [number, number, number] {
-  return [
-    ((c >> 16) & 0xFF) / 255,
-    ((c >> 8) & 0xFF) / 255,
-    (c & 0xFF) / 255,
-  ];
+// AUDIT fix: previously allocated a fresh 3-element array on every call (twice per emitter
+// per frame) — avoidable GC pressure on a hot per-frame path. Callers now pass a reusable
+// scratch array to write into instead of receiving a fresh allocation.
+function unpackColor(c: number, out: [number, number, number]): void {
+  out[0] = ((c >> 16) & 0xFF) / 255;
+  out[1] = ((c >> 8) & 0xFF) / 255;
+  out[2] = (c & 0xFF) / 255;
 }
+
+// Reusable scratch buffers for unpackColor() — see the AUDIT fix note above unpackColor().
+const _startColorScratch: [number, number, number] = [0, 0, 0];
+const _endColorScratch: [number, number, number] = [0, 0, 0];
 
 export class ParticleSystemEngine extends System {
   priority = 700;
@@ -185,8 +190,10 @@ export class ParticleSystemEngine extends System {
       const oy = ty[eid];
       const oz = tz[eid];
 
-      const [sr, sg, sb] = unpackColor(e.startColor);
-      const [er, eg, eb] = unpackColor(e.endColor);
+      unpackColor(e.startColor, _startColorScratch);
+      unpackColor(e.endColor, _endColorScratch);
+      const [sr, sg, sb] = _startColorScratch;
+      const [er, eg, eb] = _endColorScratch;
 
       let alive = e.alive;
       for (let p = 0; p < alive; p++) {
@@ -245,6 +252,18 @@ export class ParticleSystemEngine extends System {
           e.r[idx] = sr; e.g[idx] = sg; e.b[idx] = sb;
           e.alive++;
           e.accumulator -= interval;
+        }
+
+        // AUDIT fix: the while loop above exits either because accumulator drained below
+        // one interval (normal case) or because the pool is full (e.alive === maxParticles).
+        // In the latter case accumulator can still be sitting on a large "owed" balance —
+        // dt keeps accumulating every frame while the pool stays capped, and once particles
+        // die and free up slots, all of that owed time bursts out in a single frame (a
+        // visible pop instead of a steady trickle). Clamp the owed balance to a couple of
+        // particles' worth whenever we're exiting early due to the pool being full, so
+        // banked time can't grow unboundedly past what's meaningful.
+        if (e.alive >= e.maxParticles && e.accumulator > interval * 2) {
+          e.accumulator = interval * 2;
         }
       }
 

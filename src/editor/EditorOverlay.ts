@@ -40,6 +40,7 @@ export class EditorOverlay {
   private accumulator = 0;
   private refreshInterval = 0.5;
   private focusedField: string | null = null;
+  private unsubscribePreUpdate: (() => void) | null = null;
 
   private constructor(engine: AGEE) {
     this.engine = engine;
@@ -91,7 +92,18 @@ export class EditorOverlay {
 
     document.body.appendChild(this.root);
 
-    engine.events.on("preUpdate", (dt: number) => this.tick(dt));
+    this.unsubscribePreUpdate = engine.events.on("preUpdate", (dt: number) => this.tick(dt));
+  }
+
+  /** Unwinds everything the constructor wired up: the window keydown listener and the
+   *  engine's preUpdate subscription (see DevConsole.destroy()/DebugOverlay.destroy() for
+   *  the same pattern elsewhere in the debug tooling), plus the injected DOM root. Without
+   *  this, EditorOverlay was the one debug-tooling class with no way to fully tear down. */
+  destroy(): void {
+    window.removeEventListener("keydown", this.onKeyDown);
+    this.unsubscribePreUpdate?.();
+    this.unsubscribePreUpdate = null;
+    this.root?.remove();
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {

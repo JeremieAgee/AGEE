@@ -75,17 +75,17 @@ export class CommandBuffer {
           break;
         }
         case CmdType.Despawn: {
-          const eid = cmd.eid < 0 ? this.resolvedIds.get(cmd.eid) ?? cmd.eid : cmd.eid;
+          const eid = this.resolveEid(cmd.eid, "despawn");
           if (eid >= 0) world.destroyEntity(eid);
           break;
         }
         case CmdType.AddComponent: {
-          const eid = cmd.eid < 0 ? this.resolvedIds.get(cmd.eid) ?? cmd.eid : cmd.eid;
+          const eid = this.resolveEid(cmd.eid, "addComponent");
           if (eid >= 0) world.addComponent(eid, cmd.def, cmd.data);
           break;
         }
         case CmdType.RemoveComponent: {
-          const eid = cmd.eid < 0 ? this.resolvedIds.get(cmd.eid) ?? cmd.eid : cmd.eid;
+          const eid = this.resolveEid(cmd.eid, "removeComponent");
           if (eid >= 0) world.removeComponent(eid, cmd.def);
           break;
         }
@@ -93,6 +93,21 @@ export class CommandBuffer {
     }
     this.commands.length = 0;
     this.nextTempId = -1;
+  }
+
+  // A negative eid is a temp id from spawn() awaiting resolution to a real entity id. If it's
+  // still unresolved by the time this command runs (its spawn command was never queued in this
+  // buffer, targeted a different buffer, or the buffer was already flushed once before), the
+  // command used to just silently no-op -- masking spawn/despawn ordering bugs. Warn instead so
+  // they're visible.
+  private resolveEid(eid: number, opName: string): number {
+    if (eid >= 0) return eid;
+    const resolved = this.resolvedIds.get(eid);
+    if (resolved === undefined) {
+      console.warn(`[AGEE] CommandBuffer: unresolved temp id ${eid} for "${opName}" -- command skipped.`);
+      return -1;
+    }
+    return resolved;
   }
 
   get pending(): number {

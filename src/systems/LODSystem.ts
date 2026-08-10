@@ -14,6 +14,20 @@ export interface LODLevel {
 
 const LOD_HYSTERESIS = 0.1;
 
+// Mirrors Engine.ts's disposeObject3D for MeshRenderer cleanup -- geometry/material aren't
+// shared with anything else here (each LOD level owns its own mesh), so a plain traverse +
+// dispose is safe without needing the assetOwned skip that GLTF-instanced meshes require.
+function disposeLODObject3D(obj: THREE.Object3D): void {
+  obj.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (mesh.geometry) mesh.geometry.dispose();
+    if (mesh.material) {
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of materials) mat.dispose();
+    }
+  });
+}
+
 export class LODSystem extends System {
   priority = 810;
   phase: "prePhysics" | "physics" | "postPhysics" | "render" = "render";
@@ -36,6 +50,13 @@ export class LODSystem extends System {
     this.meshStore = this.world.getStore(MeshRenderer);
     this.lodStore = this.world.getStore(LODGroup);
     this.query = this.world.query(Transform, LODGroup);
+
+    // createLOD() adds every LOD level's Object3D straight into the THREE scene, bypassing
+    // the MeshRenderer component that Engine.ts's entity-destroy hook checks for -- so without
+    // this, destroying an LOD'd entity would leave every level (geometry/material/GPU buffers)
+    // in the scene forever. This mirrors the same world.onEntityDestroy registry Engine.ts and
+    // NetworkReceiveSystem already use for their own per-system cleanup (see World.ts).
+    this.world.onEntityDestroy((eid) => this.disposeForEntity(eid));
   }
 
   createLOD(eid: number, levels: LODLevel[], scene: THREE.Scene): void {
@@ -50,6 +71,21 @@ export class LODSystem extends System {
     });
 
     if (levels.length > 0) levels[0].mesh.visible = true;
+  }
+
+  /** Removes this entity's LOD levels from the scene and disposes their geometry/materials.
+   * Called automatically on entity destroy (registered in init() above); safe to call directly
+   * too. Runs before World.destroyEntity() clears component stores, so lodStore.get() below
+   * still resolves. */
+  private disposeForEntity(eid: number): void {
+    if (!this.lodStore.has(eid)) return;
+    const levels = this.lodStore.get(eid, "levelsRef") as LODLevel[] | null;
+    if (!levels) return;
+    for (const level of levels) {
+      const mesh = level.mesh;
+      if (mesh.parent) mesh.parent.remove(mesh);
+      disposeLODObject3D(mesh);
+    }
   }
 
   update(_dt: number): void {

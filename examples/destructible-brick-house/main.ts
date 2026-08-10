@@ -83,16 +83,20 @@ async function main(): Promise<void> {
 
     for (let row = 0; row < WALL_ROWS; row++) {
       const y = BRICK_HALF.y + row * (BRICK_HALF.y * 2);
+      // Running-bond pattern: shift every even row half a brick along the wall so vertical
+      // joints don't line up row over row, like real masonry (and it's stronger for it —
+      // a struck brick's neighbors above/below now overlap two bricks instead of one).
+      const offset = row % 2 === 0 ? BRICK_HALF.x : 0;
 
       // Front wall (with a doorway gap in the bottom two rows) and back wall
-      for (let x = -WIDTH_HALF + BRICK_HALF.x; x <= WIDTH_HALF - BRICK_HALF.x + 0.01; x += BRICK_HALF.x * 2) {
+      for (let x = -WIDTH_HALF + BRICK_HALF.x + offset; x <= WIDTH_HALF - BRICK_HALF.x + 0.01; x += BRICK_HALF.x * 2) {
         const isDoorway = row < 2 && x > -1 && x < 1;
         if (!isDoorway) addBrick(x, y, -DEPTH_HALF, 0);
         addBrick(x, y, DEPTH_HALF, 0);
       }
 
       // Left and right walls (rotated 90° so the brick's long axis runs along Z)
-      for (let z = -DEPTH_HALF + BRICK_HALF.x; z <= DEPTH_HALF - BRICK_HALF.x + 0.01; z += BRICK_HALF.x * 2) {
+      for (let z = -DEPTH_HALF + BRICK_HALF.x + offset; z <= DEPTH_HALF - BRICK_HALF.x + 0.01; z += BRICK_HALF.x * 2) {
         addBrick(-WIDTH_HALF, y, z, Math.PI / 2);
         addBrick(WIDTH_HALF, y, z, Math.PI / 2);
       }
@@ -107,11 +111,9 @@ async function main(): Promise<void> {
 
   buildHouse();
 
-  // Wake a still-fixed brick into a free dynamic body. Only fires for collisions Rapier
-  // actually reports, which — since fixed-vs-fixed contacts are never detected — means only
-  // the wrecking ball or an already-falling brick can trigger this. That gives the collapse a
-  // natural cascade for free: a struck brick goes dynamic, falls into its still-fixed
-  // neighbors, and wakes them in turn.
+  // Wake a still-fixed brick into a free dynamic body. Still hooked to collisions (mainly so an
+  // already-falling brick wakes the still-fixed neighbors it lands on, giving the collapse a
+  // cascade) but the wrecking ball no longer relies on this path — see wakeAlongPath() below.
   function wakeBrick(eid: number): void {
     if (!houseBrickEids.has(eid)) return;
     houseBrickEids.delete(eid);
@@ -122,6 +124,42 @@ async function main(): Promise<void> {
     wakeBrick(entityA);
     wakeBrick(entityB);
   });
+
+  // A brick can also lose its support without ever being hit: the brick directly under it gets
+  // struck, turns dynamic, and falls straight down and away — that's a contact ENDING, not a new
+  // one starting, so the onCollisionStart hook above never sees it. Left alone, the now-unsupported
+  // brick is still "fixed" (immovable by definition) and just hangs there in mid-air forever
+  // instead of dropping — the floating bricks you're seeing. Since fixed-vs-fixed contacts are
+  // never detected at all (see the addBody() comment above), any collision-end we DO get is
+  // guaranteed to involve an already-moving body, so this only fires near actual action, not
+  // across the whole resting structure. Waking both sides on END lets a freed brick fall and, if
+  // it turns out something else still holds it up, the solver just settles it back in place.
+  engine.physics.onCollisionEnd(({ entityA, entityB }) => {
+    wakeBrick(entityA);
+    wakeBrick(entityB);
+  });
+
+  // AUDIT fix: waking a brick from the collision-start callback above happens too late — Rapier
+  // resolves a step's contact response using each body's type as of the START of that step, and
+  // only reports the collision (letting us flip fixed → dynamic) after the step already ran. So
+  // the ball's very first hit on any fixed brick got treated as a hit against an infinite-mass
+  // immovable wall for that entire step — bouncing/deflecting the ball and bleeding off most of
+  // its momentum — and only the second brick onward (already dynamic by then) reacted correctly.
+  // Fix: wake bricks in a radius around each projectile every frame, BEFORE that frame's physics
+  // step runs, so by the time the ball actually touches a brick it's already a real dynamic body
+  // and the very first hit gets correct momentum transfer instead of a wall bounce.
+  const PROJECTILE_WAKE_RADIUS = 1.5;
+  function wakeAlongPath(): void {
+    for (const eid of projectiles) {
+      if (!engine.world.isAlive(eid)) continue;
+      const x = transformStore.get(eid, "x") as number;
+      const y = transformStore.get(eid, "y") as number;
+      const z = transformStore.get(eid, "z") as number;
+      for (const hitEid of engine.physics.overlapSphere(x, y, z, PROJECTILE_WAKE_RADIUS)) {
+        wakeBrick(hitEid);
+      }
+    }
+  }
 
   // Wrecking ball: right-click fires a heavy sphere from the camera along its look direction
   const projectiles: number[] = [];
@@ -141,12 +179,12 @@ async function main(): Promise<void> {
     engine.render.scene.add(mesh);
     engine.world.addComponent(eid, Transform, { x: spawnPos.x, y: spawnPos.y, z: spawnPos.z, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
     engine.world.addComponent(eid, MeshRenderer, { meshRef: mesh, visible: 1, castShadow: 1, receiveShadow: 1 });
-    engine.world.addComponent(eid, RigidBody, { bodyType: 0, mass: 6, restitution: 0.3, friction: 0.5 });
+    engine.world.addComponent(eid, RigidBody, { bodyType: 0, mass: 14, restitution: 0.3, friction: 0.5 });
     engine.physics.addBody(eid, "dynamic");
     engine.physics.addCollider(eid, "sphere", { radius: 0.6 });
 
     const body = engine.physics.getBody(eid)!;
-    const speed = 26;
+    const speed = 42;
     body.setLinvel({ x: forward.x * speed, y: forward.y * speed, z: forward.z * speed }, true);
 
     projectiles.push(eid);
@@ -177,6 +215,10 @@ async function main(): Promise<void> {
 
   const transformStore = engine.world.getStore(Transform);
   engine.events.on("preUpdate", () => {
+    // Must run before this frame's physics step (preUpdate fires ahead of the physics phase)
+    // so any brick a projectile is about to touch is already dynamic when Rapier resolves it.
+    wakeAlongPath();
+
     // Clean up projectiles that have rolled far away or fallen off the world
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const eid = projectiles[i];

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import * as THREE from "three";
 
 import { World } from "../ecs/World";
@@ -189,14 +189,15 @@ describe("AnimationSystem", () => {
   });
 
   it(
-    // AUDIT: Animator.blendFactor/blendDuration are advanced every frame by AnimationSystem
-    // (see AnimationSystem.ts:165-167) but nothing in the engine ever reads them back —
-    // actual crossfading is delegated entirely to THREE.AnimationAction.fadeIn/fadeOut,
-    // whose fade duration comes from the caller's `fadeIn` argument to play(), not from
-    // Animator.blendDuration. Correct/expected behavior: the exposed blendFactor should
-    // actually reflect (or drive) the real crossfade progress, so forcing it to 1
-    // ("fully blended") should make the outgoing action's effective weight collapse to 0.
-    "forcing blendFactor to 1 should be reflected in the outgoing action's actual weight",
+    // AUDIT fix verification: AnimationSystem must drive the crossfade by calling the real
+    // THREE.AnimationAction.setEffectiveWeight() every update() tick (the API
+    // AnimationMixer.update() actually consults while mixing) based on Animator.blendFactor,
+    // rather than overriding the public getEffectiveWeight() getter -- the mixer never calls
+    // that getter internally, so an override only fools code that explicitly calls it. This
+    // test asserts against THREE's own, unmodified getEffectiveWeight() after driving
+    // mixer.update() through several ticks, so it only passes if blendFactor genuinely altered
+    // the real mixer state.
+    "play()'s crossfade drives real action weights through mixer.update(), tracking blendFactor",
     () => {
       const world = new World();
       const animSystem = new AnimationSystem();
@@ -211,18 +212,27 @@ describe("AnimationSystem", () => {
       animSystem.play(eid, idxA, 0); // instantly fully weighted
       animSystem.update(1 / 60);
 
-      animSystem.play(eid, idxB, 0.5); // start a half-second crossfade a -> b
-
       const store = world.getStore(Animator);
-      // Simulate the "intended" semantics: the caller (or engine) forces blendFactor to
-      // represent a fully-completed blend.
-      store.set(eid, "blendFactor", 1);
-
       const slot = store.get(eid, "mixerSlot") as number;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const actionA = (animSystem as any).mixerActions[slot][idxA] as THREE.AnimationAction;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const actionB = (animSystem as any).mixerActions[slot][idxB] as THREE.AnimationAction;
 
+      animSystem.play(eid, idxB, 0.5); // start a half-second crossfade a -> b
+
+      // Halfway through the 0.5s blend (15 ticks at 1/60s == 0.25s == blendFactor 0.5), both
+      // actions' real, unmodified getEffectiveWeight() should be roughly split 50/50.
+      for (let i = 0; i < 15; i++) animSystem.update(1 / 60);
+      expect(approx(actionA.getEffectiveWeight(), 0.5, 0.1)).toBe(true);
+      expect(approx(actionB.getEffectiveWeight(), 0.5, 0.1)).toBe(true);
+
+      // Run well past the full blend duration -- the outgoing action's real weight should
+      // collapse to 0 and the incoming action should be fully weighted, both read straight off
+      // THREE's own mixer state (no getter override involved).
+      for (let i = 0; i < 30; i++) animSystem.update(1 / 60);
       expect(approx(actionA.getEffectiveWeight(), 0, 0.05)).toBe(true);
+      expect(approx(actionB.getEffectiveWeight(), 1, 0.05)).toBe(true);
     }
   );
 });
@@ -472,7 +482,7 @@ describe("ObjectPool", () => {
   it("release returns a slot to the free stack for reuse", () => {
     const { pool, created } = makePool(1);
     const first = pool.acquire()!;
-    pool.release(first.slot);
+    pool.release(first.handle);
     expect(pool.isActive(first.slot)).toBe(false);
     expect(pool.available).toBe(1);
 
@@ -486,9 +496,27 @@ describe("ObjectPool", () => {
   it("release on an already-inactive slot is a no-op", () => {
     const { pool, released } = makePool(2);
     const a = pool.acquire()!;
-    pool.release(a.slot);
-    pool.release(a.slot); // double release
+    pool.release(a.handle);
+    pool.release(a.handle); // double release
     expect(released.length).toBe(1);
+  });
+
+  it("release() with a stale handle is rejected once the slot has been reacquired (ABA protection)", () => {
+    const { pool, released } = makePool(1);
+    const first = pool.acquire()!;
+    pool.release(first.handle);
+    const second = pool.acquire()!; // reuses the same slot, new generation
+    expect(second.slot).toBe(first.slot);
+
+    // A delayed/stale caller still holding the original handle releases it again — this must
+    // NOT deactivate `second`, which is still active and in use.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    pool.release(first.handle);
+
+    expect(pool.isActive(second.slot)).toBe(true);
+    expect(released.length).toBe(1); // only the original release() went through
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 
   it("prewarm pre-creates slots onto the free stack without activating them", () => {
@@ -508,7 +536,7 @@ describe("ObjectPool", () => {
     const { pool } = makePool(3);
     const a = pool.acquire()!;
     const b = pool.acquire()!;
-    pool.release(a.slot);
+    pool.release(a.handle);
 
     const visited: number[] = [];
     pool.forEachActive((slot) => visited.push(slot));

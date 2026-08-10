@@ -61,7 +61,7 @@ export class SkeletonSystem extends System {
     const def = this.definitions.get(definitionHandle);
     if (!def) throw new Error("Invalid definition handle");
 
-    const instance = new SkeletonInstance(definitionHandle, def.boneCount);
+    const instance = new SkeletonInstance(definitionHandle, def.boneCount, def.parents);
     instance.initFromRestPose(
       def.restPosX, def.restPosY, def.restPosZ,
       def.restRotX, def.restRotY, def.restRotZ, def.restRotW
@@ -426,7 +426,11 @@ export class SkeletonSystem extends System {
     // entirely. Mirrors TransformHierarchySystem's dirty-subtree skip for the same reason:
     // this runs every frame for every non-ragdolled instance, and most skeletons are idle
     // most of the time.
-    if (!dirty && !this.hasDirtyLocalDescendant(def, instance, boneIndex)) {
+    //
+    // hasDirtyLocalDescendant() is an O(1) read of a flag maintained incrementally by
+    // SkeletonInstance.markLocalDirty()'s upward propagation (set at the point a descendant is
+    // dirtied, not recomputed by re-walking the subtree here every frame for every clean bone).
+    if (!dirty && !this.hasDirtyLocalDescendant(instance, boneIndex)) {
       return;
     }
 
@@ -474,19 +478,22 @@ export class SkeletonSystem extends System {
       this.evaluateBoneFK(def, instance, child, dirty);
       child = def.nextSibling[child];
     }
+
+    // Reaching here (rather than the early-return above) means this call always fully walked
+    // boneIndex's entire subtree, and every dirty descendant it found along the way got
+    // recomputed and had its own LOCAL flag cleared in the `if (dirty)` branch above. So no
+    // descendant below boneIndex is dirty anymore -- safe to clear the cached flag now instead
+    // of leaving it set until some unrelated future check re-derives the same answer.
+    instance.dirtyFlags[boneIndex] &= ~DirtyFlags.DESCENDANT_DIRTY;
   }
 
-  // Recursively checks whether any bone below (not including) boneIndex has a pending LOCAL
-  // change, so a clean-and-parent-clean ancestor knows whether it's still safe to skip the
-  // whole subtree instead of recomputing it.
-  private hasDirtyLocalDescendant(def: SkeletonDefinition, instance: SkeletonInstance, boneIndex: number): boolean {
-    let child = def.firstChild[boneIndex];
-    while (child !== -1) {
-      if (instance.isDirty(child, DirtyFlags.LOCAL)) return true;
-      if (this.hasDirtyLocalDescendant(def, instance, child)) return true;
-      child = def.nextSibling[child];
-    }
-    return false;
+  // O(1) read of the cached "some descendant has a pending LOCAL change" flag, maintained
+  // incrementally by SkeletonInstance.markLocalDirty() (set on write, propagated up the
+  // ancestor chain) and cleared above once a subtree walk has fully resolved it — not
+  // recomputed by re-walking every descendant of every clean bone on every single frame, which
+  // canceled out most of this skip optimization's benefit at scale.
+  private hasDirtyLocalDescendant(instance: SkeletonInstance, boneIndex: number): boolean {
+    return instance.isDirty(boneIndex, DirtyFlags.DESCENDANT_DIRTY);
   }
 
   destroy(): void {

@@ -63,6 +63,14 @@ export class ArchetypeIndex {
   // when the churn had nothing to do with that query's component mask. A query mask `m` is
   // affected by this transition iff the entity was (or now is) part of an archetype that
   // satisfies `m` — i.e. (oldMask & m) === m or (newMask & m) === m.
+  //
+  // Note this only gates *whether* a bump happens, not its blast radius: `_version` is a single
+  // shared counter, and every entry in matchCache is compared against that same counter in
+  // matching() below. So once any one relevant transition bumps it, every cached query is
+  // treated as stale on its next access and rebuilds -- including ones whose mask had nothing
+  // to do with the transition that triggered the bump. This is coarser than true per-query
+  // invalidation (which would only rebuild the specific affected query's cache entry); it just
+  // avoids bumping at all for transitions no live query cares about.
   private bumpIfRelevant(oldMask: Mask, newMask: Mask): void {
     for (const entry of this.matchCache.values()) {
       if (maskContainsAll(oldMask, entry.mask) || maskContainsAll(newMask, entry.mask)) {

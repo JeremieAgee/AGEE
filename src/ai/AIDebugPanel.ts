@@ -305,10 +305,9 @@ export class AIDebugPanel extends System {
     let rows = "";
     const skipKeys = new Set(["eid", "dt", "x", "y", "z"]);
 
-    const data = (bb as any).data as Map<string, any>;
-    if (!data || data.size === 0) return "";
+    if (bb.size === 0) return "";
 
-    for (const [key, val] of data) {
+    for (const [key, val] of bb.entries()) {
       if (skipKeys.has(key)) continue;
       // Blackboard values are `any` and set at runtime by arbitrary AI/game code — unlike
       // component fields (numeric/boolean only, see ComponentSchema) a blackboard entry can

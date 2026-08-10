@@ -46,6 +46,15 @@ export function resolveUIOverlay(overlayId: string): HTMLElement {
   return document.getElementById(overlayId) ?? document.body;
 }
 
+// AUDIT fix: DOM event forwarding used to be Button-specific (its createElement() was the
+// only place that ever called emit()), so Panel/Label/ProgressBar/Image had a fully wired
+// on()/emit() API that nothing ever fed — e.g. `panel.on("click", fn)` silently never fired.
+// Every Widget subclass mounts through the same createElement()->this.element pattern, so
+// the forwarding is hooked once here instead of duplicated per subclass. Kept to the common
+// interactive DOM events rather than everything (e.g. no mousemove/wheel) to avoid needless
+// per-frame listener overhead on widgets that don't need it.
+const FORWARDED_DOM_EVENTS = ["click", "dblclick", "mousedown", "mouseup", "mouseenter", "mouseleave", "contextmenu"] as const;
+
 export abstract class Widget {
   id: string;
   style: UIStyle;
@@ -84,16 +93,38 @@ export abstract class Widget {
     return this;
   }
 
+  // AUDIT fix: previously fired only this widget's own handlers, so a click on a child never
+  // reached a listener registered on an ancestor (`this.parent` existed but nothing walked
+  // it). Bubbling unconditionally to the parent mirrors DOM bubbling semantics and matches
+  // the "click on a child naturally reaches a parent listener" expectation — there's no
+  // stopPropagation-equivalent concept elsewhere in this widget tree, so there's nothing to
+  // gate it on.
   emit(event: string, ...args: any[]): void {
     this.eventHandlers.get(event)?.forEach((h) => h(...args));
+    this.parent?.emit(event, ...args);
   }
 
   abstract createElement(): HTMLElement;
+
+  private bindDomEvents(): void {
+    for (const type of FORWARDED_DOM_EVENTS) {
+      this.element.addEventListener(type, (e: Event) => {
+        // Native DOM bubbling would otherwise walk up to ancestor widgets' own listeners
+        // (they're real DOM children) AND emit()'s own parent-walk would bubble through the
+        // widget tree — stopPropagation() here means the DOM event is translated into a
+        // widget emit() exactly once, at the deepest widget, and emit() alone drives the
+        // walk up to ancestors from there.
+        e.stopPropagation();
+        this.emit(type, e);
+      });
+    }
+  }
 
   mount(parent: HTMLElement): void {
     this.element = this.createElement();
     this.element.id = `ui-${this.id}`;
     this.applyStyle();
+    this.bindDomEvents();
     parent.appendChild(this.element);
 
     for (const child of this.children) {
@@ -199,7 +230,8 @@ export class Button extends Widget {
     el.textContent = this.text;
     el.style.border = "none";
     el.style.outline = "none";
-    el.addEventListener("click", () => this.emit("click"));
+    // "click" forwarding is now handled generically by Widget.bindDomEvents() (see the
+    // FORWARDED_DOM_EVENTS AUDIT fix note) — Button no longer needs its own listener.
     return el;
   }
 

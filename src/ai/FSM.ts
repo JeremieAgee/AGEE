@@ -122,6 +122,14 @@ export class FSMRunner {
 
     for (const transition of state.transitions) {
       if (transition.guard(eid, instance.blackboard)) {
+        // A transition targeting the state we're already in is a no-op, not a real state
+        // change: without this guard, a persistent self-transition guard would fire
+        // onExit -> onEnter -> onUpdate and reset timeInState every single tick it stays true,
+        // even though nothing about the FSM's state actually changed. Fall through to the
+        // normal "no transition matched" handling below instead (still runs onUpdate, keeps
+        // accumulating timeInState).
+        if (transition.to === instance.currentState) break;
+
         const nextState = instance.definition.states.get(transition.to);
         if (!nextState) continue;
 

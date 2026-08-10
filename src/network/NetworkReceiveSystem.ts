@@ -1,7 +1,7 @@
 import { System, SystemPhase } from "../ecs/System";
 import { Query } from "../ecs/Query";
 import { ComponentStore } from "../ecs/ComponentStore";
-import { Transform } from "../core/Components";
+import { Transform, Velocity } from "../core/Components";
 import { Replicated, NetworkOwner, NetworkInterpolated } from "./NetworkComponents";
 import { Transport, TransportEvent } from "./transport/Transport";
 import { SnapshotManager } from "./SnapshotManager";
@@ -63,6 +63,11 @@ export class NetworkReceiveSystem extends System {
   private ownerStore!: ComponentStore;
   private interpStore!: ComponentStore;
   private interpQuery!: Query;
+  private velocityStore!: ComponentStore;
+
+  // Server-mode: entities carrying Replicated, queried each tick to resolve a client's
+  // owned entity (Replicated.owner === clientId) for applying that client's received input.
+  private replicatedQuery!: Query;
 
   // Interpolation arrays (mirrors PhysicsSystem pattern)
   private prevX = new Float32Array(INITIAL_INTERP_CAPACITY);
@@ -88,6 +93,18 @@ export class NetworkReceiveSystem extends System {
 
   // Client-mode: callback for prediction replay
   private _onReconcile: ((serverTick: number, inputs: InputPayload[]) => void) | null = null;
+
+  // AUDIT FIX: getReceivedInputs() was populated every tick (validated, rate-limited,
+  // replay-protected) but nothing ever drained it -- there was no server-authoritative
+  // simulation step that applied a client's input to their owned entity at all. Server-mode:
+  // applyReceivedInputs() (called from update()) now drains getReceivedInputs() every tick and
+  // applies each validated input to the entity owned by that client (Replicated.owner ===
+  // clientId), via this optional host-supplied hook when set. When unset, a generic default
+  // (applyInputDefault) writes any action whose name matches a Velocity field (vx/vy/vz/ax/ay/az)
+  // straight onto that entity's Velocity component -- the same name-matched field application
+  // the rest of this file already does for replicated Snapshot/Delta data, so it requires no
+  // game-specific movement logic to close the wiring gap.
+  private _onApplyInput: ((eid: number, input: InputPayload) => void) | null = null;
 
   // Client-mode: token sent in the Connect handshake once the transport reports "connected" —
   // see dispatchEvent()'s "connected" case. Set via NetworkManager.connect(url, token).
@@ -155,12 +172,20 @@ export class NetworkReceiveSystem extends System {
     this._onReconcile = fn;
   }
 
+  /** Server-mode: overrides how a validated Input is applied to its owning entity each tick
+   *  (see applyReceivedInputs()). Pass null to restore the built-in Velocity-field default. */
+  set onApplyInput(fn: ((eid: number, input: InputPayload) => void) | null) {
+    this._onApplyInput = fn;
+  }
+
   init(): void {
     this.transformStore = this.world.getStore(Transform);
     this.replicatedStore = this.world.getStore(Replicated);
     this.ownerStore = this.world.getStore(NetworkOwner);
     this.interpStore = this.world.getStore(NetworkInterpolated);
     this.interpQuery = this.world.query(NetworkInterpolated, Transform);
+    this.velocityStore = this.world.getStore(Velocity);
+    this.replicatedQuery = this.world.query(Replicated);
 
     this.world.onEntityDestroy((eid) => {
       const nid = this.entityToNetworkId.get(eid);
@@ -189,6 +214,10 @@ export class NetworkReceiveSystem extends System {
       for (let i = 0; i < events.length; i++) {
         this.dispatchEvent(events[i], transport, clientId);
       }
+    }
+
+    if (this.role === "server") {
+      this.applyReceivedInputs();
     }
 
     this.processSpawns();
@@ -361,6 +390,53 @@ export class NetworkReceiveSystem extends System {
     this.clientTransports.delete(clientId);
     this.lastAcceptedInputTick.delete(clientId);
     this.inputMessageCountThisPoll.delete(clientId);
+  }
+
+  /** Server-mode: the actual simulation-application step for validated client input. Drains
+   *  getReceivedInputs() (already validated, rate-limited and replay-protected by
+   *  handleMessage's Input case above) and applies each one to the entity that client owns,
+   *  resolved via Replicated.owner === clientId -- the same server-side ownership field
+   *  SnapshotManager/InterestManager already key off of. */
+  private applyReceivedInputs(): void {
+    if (this.receivedInputs.length === 0) return;
+
+    const clientIdToEntity = new Map<number, number>();
+    for (const eid of this.replicatedQuery.entities) {
+      const owner = this.replicatedStore.get(eid, "owner") as number;
+      if (owner !== NETWORK_CONSTANTS.SERVER_CLIENT_ID) {
+        clientIdToEntity.set(owner, eid);
+      }
+    }
+
+    for (const input of this.receivedInputs) {
+      const eid = clientIdToEntity.get(input.clientId);
+      if (eid === undefined) continue;
+      this.applyInputToEntity(eid, input);
+    }
+  }
+
+  private applyInputToEntity(eid: number, input: InputPayload): void {
+    if (this._onApplyInput) {
+      this._onApplyInput(eid, input);
+      return;
+    }
+    this.applyInputDefault(eid, input);
+  }
+
+  // Generic default: writes any action whose name matches a Velocity field directly onto
+  // that entity's Velocity component. Requires no game-specific movement semantics -- a game
+  // that sends actions named "vx"/"vy"/"vz"/"ax"/"ay"/"az" gets authoritative input application
+  // out of the box; anything else should set onApplyInput to its own translation.
+  private static readonly VELOCITY_FIELDS = ["vx", "vy", "vz", "ax", "ay", "az"] as const;
+
+  private applyInputDefault(eid: number, input: InputPayload): void {
+    if (!this.velocityStore.has(eid)) return;
+    for (const field of NetworkReceiveSystem.VELOCITY_FIELDS) {
+      const value = input.actions.get(field);
+      if (value !== undefined) {
+        this.velocityStore.set(eid, field, value);
+      }
+    }
   }
 
   private processServerSnapshot(snapshot: Snapshot): void {

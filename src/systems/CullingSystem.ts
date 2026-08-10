@@ -70,6 +70,18 @@ export class CullingSystem extends System {
     this.meshStore = this.world.getStore(MeshRenderer);
     this.gpuMeshStore = this.world.getStore(GPUMeshRenderer);
     this.query = this.world.query(Transform, MeshRenderer);
+
+    // subtreeBoundsCache is keyed by eid and holds a THREE.Object3D reference (plus its
+    // computed Box3) -- without this it grows forever and keeps destroyed entities' meshes
+    // from being GC'd. Same world.onEntityDestroy registry Engine.ts/LODSystem/
+    // NetworkReceiveSystem use for their own per-system cleanup (see World.ts).
+    this.world.onEntityDestroy((eid) => this.onEntityDestroyed(eid));
+  }
+
+  /** Drops this entity's cached subtree-bounds entry, if any. Called automatically on entity
+   * destroy (registered in init() above); safe to call directly too. */
+  onEntityDestroyed(eid: number): void {
+    this.subtreeBoundsCache.delete(eid);
   }
 
   update(_dt: number): void {
@@ -80,6 +92,8 @@ export class CullingSystem extends System {
       this.camera.projectionMatrix,
       this.camera.matrixWorldInverse
     );
+    // THREE's camera.projectionMatrix is always -1..1 (OpenGL) NDC z-range, which is
+    // setFromProjectionMatrix's default -- see Frustum.ts for why that matters.
     this.frustum.setFromProjectionMatrix(this.projScreenMatrix.elements);
 
     const entities = this.query.entities;

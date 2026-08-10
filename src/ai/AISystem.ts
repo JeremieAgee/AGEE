@@ -45,7 +45,14 @@ export class AISystem extends System {
   readonly btRunner = new BehaviorTreeRunner();
   readonly fsmRunner = new FSMRunner();
   readonly utilityRunner = new UtilityRunner();
-  readonly goapPlanner = new GOAPPlanner();
+  // standalone: false — AISystem.update() calls goapPlanner.beginFrame() once per real frame
+  // itself and is the sole source of truth for the shared per-frame iteration budget, so the
+  // planner's own time-window auto-refill (meant only for callers driving tick() directly
+  // without ever calling beginFrame()) must stay disabled here. See GOAP.ts's `standalone`
+  // field for why: without this, a later agent's ensureBudget() call could silently refill the
+  // budget mid-loop if AISystem's entity loop runs long, blowing past the per-frame cap right
+  // when many agents replanning at once is exactly what it's meant to protect against.
+  readonly goapPlanner = new GOAPPlanner(false);
 
   // Handle pools — BT trees and Blackboards behind handles, not per-entity Maps
   private treePools = new HandleMap<BTNode>();
@@ -278,10 +285,19 @@ export class AISystem extends System {
       }
     }
 
-    this.updatePerception();
+    this.updatePerception(dt);
   }
 
-  private updatePerception(): void {
+  // Per-second rates, not per-call increments: updatePerception() used to bump alertLevel by a
+  // fixed 0.1/-0.05 once per update() call regardless of dt, so alert rose/decayed faster in
+  // wall-clock time at higher framerates (e.g. ~2.4x faster at 144fps vs 60fps) -- breaking
+  // determinism for multiplayer reconciliation/replay, unlike Steering/Navigation which already
+  // step on a fixed-timestep accumulator for exactly this reason. Tuned so behavior at the
+  // reference 60fps matches the old per-call increments: 0.1 * 60 = 6.0, 0.05 * 60 = 3.0.
+  private static readonly ALERT_RISE_RATE = 6.0;
+  private static readonly ALERT_DECAY_RATE = 3.0;
+
+  private updatePerception(dt: number): void {
     const perceivers = this.perceptionQuery.entities;
     if (perceivers.length === 0) return;
 
@@ -359,9 +375,9 @@ export class AISystem extends System {
         targetLastX[eid] = tx[closestTarget];
         targetLastY[eid] = ty[closestTarget];
         targetLastZ[eid] = tz[closestTarget];
-        alertLevels[eid] = Math.min(1, alertLevels[eid] + 0.1);
+        alertLevels[eid] = Math.min(1, alertLevels[eid] + AISystem.ALERT_RISE_RATE * dt);
       } else {
-        alertLevels[eid] = Math.max(0, alertLevels[eid] - 0.05);
+        alertLevels[eid] = Math.max(0, alertLevels[eid] - AISystem.ALERT_DECAY_RATE * dt);
         if (alertLevels[eid] <= 0) {
           hasTargets[eid] = 0;
           targetEntities[eid] = -1;

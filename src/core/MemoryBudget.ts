@@ -1,4 +1,4 @@
-import { Handle, HandleMap, HandleEntry, ResourceType, handleIndex } from "./handles/Handle";
+import { Handle, ResourceType } from "./handles/Handle";
 
 export interface BudgetConfig {
   textures: number;
@@ -13,6 +13,21 @@ export interface EvictionCandidate {
   memorySize: number;
   lastAccess: number;
   refCount: number;
+}
+
+// Structural, not the concrete HandleMap<T> class, so a resource pool that isn't backed by a
+// HandleMap (e.g. AssetStore, which uses its own SOA + HandleAllocator) can still be evicted
+// through evictLRU() below without evictLRU needing to know its internal representation.
+export interface EvictionEntry {
+  resourceType: ResourceType;
+  refCount: number;
+  memorySize: number;
+  lastAccess: number;
+}
+
+export interface EvictionSource {
+  forEachEntry(callback: (entry: EvictionEntry, index: number) => void): void;
+  handleAt(index: number): Handle | null;
 }
 
 export class MemoryBudget {
@@ -84,7 +99,7 @@ export class MemoryBudget {
     return this.budgets.get(type) ?? Infinity;
   }
 
-  evictLRU(resources: HandleMap<any>, type: ResourceType, targetFreeBytes: number): Handle[] {
+  evictLRU(resources: EvictionSource, type: ResourceType, targetFreeBytes: number): Handle[] {
     const candidates: EvictionCandidate[] = [];
 
     resources.forEachEntry((entry, index) => {

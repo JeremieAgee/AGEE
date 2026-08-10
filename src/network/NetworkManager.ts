@@ -217,7 +217,15 @@ export class NetworkManager {
       clientTransport.disconnect();
       return false;
     }
-    this.sendSystem.addClient(clientId, clientTransport);
+    // AUDIT FIX: NETWORK_CONSTANTS.MAX_CLIENTS previously had no enforcement anywhere — an
+    // unlimited number of clients could be registered. sendSystem.addClient() is the source of
+    // truth for the connected-client count and now refuses a new slot past the cap (a reconnect
+    // of an already-registered clientId is still allowed); mirror that refusal here so the
+    // transport is disconnected and receiveSystem never registers it either.
+    if (!this.sendSystem.addClient(clientId, clientTransport)) {
+      clientTransport.disconnect();
+      return false;
+    }
     this.receiveSystem.addClientTransport(clientId, clientTransport);
     // AUDIT FIX: writeConnectAck() previously had zero call sites -- a client's localClientId
     // (set by NetworkReceiveSystem's ConnectAck handler) stayed -1 forever unless a game bypassed

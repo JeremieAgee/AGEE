@@ -26,6 +26,10 @@ export class WebGPUOverlaySystem extends System {
   private time = 0;
   private initialized = false;
   private supported = false;
+  // True while the last update() actually rendered a visible (non-fully-transparent) frame --
+  // see the early-out at the top of update() for why this needs one extra frame past
+  // "inactive" before skipping the render pass entirely.
+  private wasRendering = false;
   private aimProvider: AimProvider = () => ({
     x: window.innerWidth * 0.5,
     y: window.innerHeight * 0.5,
@@ -230,6 +234,18 @@ fn fs(in: VertexOut) -> @location(0) vec4<f32> {
 
     this.time += dt;
     const aim = this.aimProvider();
+    const isActive = aim.active || !!(aim.intensity && aim.intensity > 0);
+
+    // Skip the full-viewport shader pass once the canvas is already showing nothing -- there's
+    // nothing left to draw (aura/reticle terms in fs() are all gated by u.is_active/intensity).
+    // Still run one more pass on the active->inactive transition frame (wasRendering was true)
+    // so the last visible reticle actually gets cleared to transparent instead of freezing on
+    // screen forever; only steady-state "nothing is happening" frames get skipped.
+    if (!isActive && !this.wasRendering) {
+      return;
+    }
+    this.wasRendering = isActive;
+
     this.uniformData[0] = this.canvas.width;
     this.uniformData[1] = this.canvas.height;
     this.uniformData[2] = this.time;

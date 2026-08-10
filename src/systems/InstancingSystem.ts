@@ -32,7 +32,18 @@ export class InstancingSystem extends System {
   private groupEntityIndex: Map<number, number>[];
   private groupCapacities: Int32Array;
   private groupDirty: Uint8Array;
+  // High-water mark of slot indices ever handed out (bounds the update()/destroy() loops below),
+  // NOT a count of concurrently-active groups -- freed slots are reclaimed via freeGroupIds
+  // instead of this ever decrementing, so lifetime group churn (create/destroy/create/...) can't
+  // exhaust the fixed MAX_GROUPS-sized arrays the way a monotonically-increasing counter would.
   private groupCount = 0;
+  // Indices freed by destroyGroup(), available for createGroup() to reuse before growing
+  // groupCount further.
+  private freeGroupIds: number[] = [];
+  // Tracks which slots are currently live, so destroyGroup() is idempotent (double-destroying
+  // the same id -- e.g. via destroy()'s own loop after a caller already destroyed it -- can't
+  // push the same freed id onto freeGroupIds twice).
+  private groupActive: Uint8Array;
 
   // Per-entity dirty tracking: only update matrices for entities that moved
   private entityDirty: Set<number>[] = [];
@@ -52,6 +63,7 @@ export class InstancingSystem extends System {
     this.groupCapacities = new Int32Array(MAX_GROUPS);
     this.groupDirty = new Uint8Array(MAX_GROUPS);
     this.groupFullRebuild = new Uint8Array(MAX_GROUPS);
+    this.groupActive = new Uint8Array(MAX_GROUPS);
     for (let i = 0; i < MAX_GROUPS; i++) {
       this.entityDirty.push(new Set());
     }
@@ -71,7 +83,18 @@ export class InstancingSystem extends System {
     material: THREE.Material,
     initialCapacity: number = 100
   ): number {
-    const id = this.groupCount++;
+    // Reuse a destroyGroup()'d slot before growing groupCount -- keeps the fixed-size
+    // MAX_GROUPS arrays bounded by concurrently-active groups, not lifetime creation count.
+    let id: number;
+    if (this.freeGroupIds.length > 0) {
+      id = this.freeGroupIds.pop()!;
+    } else {
+      if (this.groupCount >= MAX_GROUPS) {
+        throw new Error(`[AGEE] InstancingSystem: cannot exceed ${MAX_GROUPS} concurrently-active instancing groups.`);
+      }
+      id = this.groupCount++;
+    }
+
     const mesh = new THREE.InstancedMesh(geometry, material, initialCapacity);
     mesh.count = 0;
     mesh.castShadow = true;
@@ -84,12 +107,13 @@ export class InstancingSystem extends System {
     this.groupCapacities[id] = initialCapacity;
     this.groupDirty[id] = 1;
     this.groupFullRebuild[id] = 1;
+    this.groupActive[id] = 1;
 
     return id;
   }
 
   addToGroup(eid: number, groupId: number): void {
-    if (groupId >= this.groupCount) return;
+    if (groupId >= this.groupCount || !this.groupActive[groupId]) return;
 
     const entities = this.groupEntities[groupId];
     this.groupEntityIndex[groupId].set(eid, entities.length);
@@ -106,7 +130,7 @@ export class InstancingSystem extends System {
   }
 
   removeFromGroup(eid: number, groupId: number): void {
-    if (groupId >= this.groupCount) return;
+    if (groupId >= this.groupCount || !this.groupActive[groupId]) return;
     const entities = this.groupEntities[groupId];
     const indexMap = this.groupEntityIndex[groupId];
     const idx = indexMap.get(eid);
@@ -236,6 +260,9 @@ export class InstancingSystem extends System {
   }
 
   destroyGroup(groupId: number): void {
+    if (groupId >= MAX_GROUPS || !this.groupActive[groupId]) return;
+    this.groupActive[groupId] = 0;
+
     const mesh = this.groupMeshes[groupId];
     if (mesh) {
       this.scene.remove(mesh);
@@ -247,6 +274,11 @@ export class InstancingSystem extends System {
     this.groupEntities[groupId] = [];
     this.groupEntityIndex[groupId]?.clear();
     this.entityDirty[groupId]?.clear();
+    this.groupCapacities[groupId] = 0;
+    this.groupDirty[groupId] = 0;
+    this.groupFullRebuild[groupId] = 0;
+    // Reclaim the slot for a future createGroup() instead of letting groupCount grow forever.
+    this.freeGroupIds.push(groupId);
   }
 
   destroy(): void {
